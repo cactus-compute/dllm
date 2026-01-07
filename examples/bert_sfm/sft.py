@@ -44,6 +44,10 @@ class DataArguments(dllm.utils.DataArguments):
     dataset_args: str = "tatsu-lab/alpaca"
     max_length: int = 512
     load_preprocessed_data: bool = False
+    skip_post_process: bool = field(
+        default=False,
+        metadata={"help": "Skip post-processing (truncation/filtering) if already done during preprocessing"},
+    )
     mask_prompt_loss: bool = field(
         default=True,
         metadata={"help": "Whether to mask the loss on the prompt tokens"},
@@ -95,7 +99,8 @@ def train():
                 desc="Mapping dataset to SFT format",
             )
         # truncate / filter long sequences if needed
-        dataset = dllm.utils.post_process_dataset(dataset, data_args)
+        if not data_args.skip_post_process:
+            dataset = dllm.utils.post_process_dataset(dataset, data_args)
 
     # ----- Training --------------------------------------------------------------
     accelerate.PartialState().wait_for_everyone()
