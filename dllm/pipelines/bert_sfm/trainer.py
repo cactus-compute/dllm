@@ -97,19 +97,20 @@ def geodesic_interpolant(
     return exp_map(x_0, t * log_map(x_0, x_1))
 
 
-def uniform_prior(shape: tuple, device: torch.device) -> torch.Tensor:
+def uniform_prior(shape: tuple, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """
     Sample uniformly from positive orthant of the sphere.
 
     Args:
         shape: Shape of output tensor, last dim is the manifold dimension
         device: Device to create tensor on
+        dtype: Data type for the tensor
 
     Returns:
         Points on positive orthant of unit sphere
     """
     # Sample from standard normal and take absolute value for positive orthant
-    x = torch.randn(shape, device=device).abs()
+    x = torch.randn(shape, device=device, dtype=dtype).abs()
     # Project to sphere
     return x / torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-8)
 
@@ -310,6 +311,13 @@ class BertSFMTrainer(transformers.Trainer):
         # Positions where we compute loss (not -100)
         loss_mask = labels != -100  # [b, l]
 
+        # Get the embedding layer and its dtype (set by accelerate/deepspeed mixed precision)
+        if hasattr(model, "get_input_embeddings"):
+            embed_layer = model.get_input_embeddings()
+        else:
+            embed_layer = model.model.embed_tokens
+        compute_dtype = embed_layer.weight.dtype
+
         # === 1. Sample diffusion timesteps ===
         # t ∈ [ε, 1) to avoid degenerate values
         t = self.time_epsilon + (1 - self.time_epsilon) * torch.rand(b, device=device)
@@ -319,13 +327,13 @@ class BertSFMTrainer(transformers.Trainer):
 
         # === 2. Convert tokens to manifold representation ===
         # Create one-hot encoding of input tokens
-        x_1_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()  # [b, l, V]
+        x_1_onehot = F.one_hot(input_ids, num_classes=vocab_size).to(compute_dtype)  # [b, l, V]
 
         # Map one-hot (simplex) to sphere
         x_1 = simplex_to_sphere(x_1_onehot)  # [b, l, V]
 
         # === 3. Sample noise from uniform prior on sphere ===
-        x_0 = uniform_prior((b, l, vocab_size), device=device)  # [b, l, V]
+        x_0 = uniform_prior((b, l, vocab_size), device=device, dtype=compute_dtype)  # [b, l, V]
 
         # === 4. Geodesic interpolation ===
         # alpha_t needs shape (B, 1, 1) for broadcasting with (B, L, V)
@@ -341,20 +349,9 @@ class BertSFMTrainer(transformers.Trainer):
         )
 
         # === 5. Forward pass ===
-        # The model receives the interpolated points (soft embeddings)
-        # We need to convert x_t back to a form the model can process
-        # Since BERT expects discrete tokens, we use x_t as soft input embeddings
-
-        # Get the embedding layer
-        if hasattr(model, "get_input_embeddings"):
-            embed_layer = model.get_input_embeddings()
-        else:
-            embed_layer = model.model.embed_tokens
-
         # Compute soft embeddings: x_t @ embedding_matrix
         # x_t: [b, l, V], embed_weight: [V, D] -> [b, l, D]
-        # Cast to match embedding dtype (handles mixed precision training)
-        soft_embeddings = torch.matmul(x_t.to(embed_layer.weight.dtype), embed_layer.weight)
+        soft_embeddings = torch.matmul(x_t, embed_layer.weight)
 
         # Forward pass with soft embeddings
         # Most HuggingFace models accept inputs_embeds
