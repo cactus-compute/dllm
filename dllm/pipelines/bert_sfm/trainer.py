@@ -331,6 +331,15 @@ class BertSFMTrainer(transformers.Trainer):
         # alpha_t needs shape (B, 1, 1) for broadcasting with (B, L, V)
         x_t = geodesic_interpolant(x_0, x_1, alpha_t)  # [b, l, V]
 
+        # === 4b. Keep prompt positions clean (not noised) ===
+        # For positions where loss_mask=False (prompt), use the clean x_1 instead of x_t
+        # This teaches the model to condition on clean prompts while denoising targets
+        x_t = torch.where(
+            loss_mask.unsqueeze(-1).expand_as(x_t),
+            x_t,  # Target positions: interpolated (noisy)
+            x_1,  # Prompt positions: clean one-hot on sphere
+        )
+
         # === 5. Forward pass ===
         # The model receives the interpolated points (soft embeddings)
         # We need to convert x_t back to a form the model can process
