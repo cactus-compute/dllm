@@ -77,9 +77,16 @@ def preprocess_sft_dataset(
         else:
             print(f"[INFO] Truncated to max_length={max_length}: train={after_train}, test={after_test}")
 
-    # Keep only the three required columns to save space.
+    # Add length column for group_by_length (avoids slow computation at training time)
+    def add_length(row):
+        row["length"] = len(row["input_ids"])
+        return row
+
+    processed = processed.map(add_length, num_proc=num_proc, desc="Adding length column")
+
+    # Keep only the required columns to save space.
     if remove_columns:
-        keep = {"input_ids", "labels", "prompt_len", "attention_mask"}
+        keep = {"input_ids", "labels", "prompt_len", "attention_mask", "length"}
 
         def strip_cols(ds: datasets.Dataset) -> datasets.Dataset:
             drop = [c for c in ds.column_names if c not in keep]
