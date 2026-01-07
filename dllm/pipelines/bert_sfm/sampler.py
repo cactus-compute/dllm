@@ -198,8 +198,10 @@ class BertSFMSampler(BaseSampler):
         inference_scaling = kwargs.get("inference_scaling", config.inference_scaling)
         return_dict = kwargs.get("return_dict", config.return_dict)
 
-        device = self.model.device
-        vocab_size = self.model.config.vocab_size
+        # Handle DataParallel/DistributedDataParallel wrapped models
+        unwrapped_model = self.model.module if hasattr(self.model, "module") else self.model
+        device = unwrapped_model.device if hasattr(unwrapped_model, "device") else next(unwrapped_model.parameters()).device
+        vocab_size = unwrapped_model.config.vocab_size
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 
         # Convert inputs to tensors
@@ -347,8 +349,10 @@ class BertSFMSampler(BaseSampler):
         inference_scaling = kwargs.get("inference_scaling", config.inference_scaling)
         return_dict = kwargs.get("return_dict", config.return_dict)
 
-        device = self.model.device
-        vocab_size = self.model.config.vocab_size
+        # Handle DataParallel/DistributedDataParallel wrapped models
+        unwrapped_model = self.model.module if hasattr(self.model, "module") else self.model
+        device = unwrapped_model.device if hasattr(unwrapped_model, "device") else next(unwrapped_model.parameters()).device
+        vocab_size = unwrapped_model.config.vocab_size
         mask_id = self.tokenizer.mask_token_id
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 

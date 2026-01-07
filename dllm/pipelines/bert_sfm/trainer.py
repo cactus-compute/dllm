@@ -302,7 +302,9 @@ class BertSFMTrainer(transformers.Trainer):
         attention_mask = inputs.get("attention_mask", None)
 
         b, l = input_ids.shape
-        vocab_size = model.config.vocab_size
+        # Handle DataParallel/DistributedDataParallel wrapped models
+        unwrapped_model = model.module if hasattr(model, "module") else model
+        vocab_size = unwrapped_model.config.vocab_size
         device = input_ids.device
 
         # Positions where we compute loss (not -100)
