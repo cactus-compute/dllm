@@ -344,7 +344,8 @@ class BertSFMTrainer(transformers.Trainer):
 
         # Compute soft embeddings: x_t @ embedding_matrix
         # x_t: [b, l, V], embed_weight: [V, D] -> [b, l, D]
-        soft_embeddings = torch.matmul(x_t, embed_layer.weight)
+        # Cast x_t to match embedding dtype (handles mixed precision training)
+        soft_embeddings = torch.matmul(x_t.to(embed_layer.weight.dtype), embed_layer.weight)
 
         # Forward pass with soft embeddings
         # Most HuggingFace models accept inputs_embeds
