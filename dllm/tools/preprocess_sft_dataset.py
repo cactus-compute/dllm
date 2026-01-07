@@ -6,6 +6,7 @@ PYTHONPATH=. python dllm/tools/preprocess_sft_dataset.py \
     --sft_map_fn_path "dllm.utils.ar_mdlm_sft_map_fn" \
     --dataset_args "allenai/tulu-3-sft-mixture" \
     --output_dir "data/sft/dream/tulu-3-sft-mixture" \
+    --max_length 1024 \
     --num_proc 64
 """
 
@@ -29,6 +30,8 @@ class ScriptArguments:
     dataset_args: str = "HuggingFaceTB/smoltalk"  # required
     output_dir: str = "data/sft/llada/smoltalk"  # required
     mask_prompt_loss: bool = True  # Mask prompt tokens in labels with -100
+    max_length: int | None = None  # If set, truncate/filter sequences to this length
+    truncation: str = "right"  # "right" to truncate, "filter" to remove long sequences
     num_proc: int = 32
     remove_columns: bool = False
 
@@ -36,12 +39,16 @@ class ScriptArguments:
         self.model_name_or_path = dllm.utils.resolve_with_base_env(
             self.model_name_or_path, "BASE_MODELS_DIR"
         )
+        if self.truncation not in ("right", "filter"):
+            raise ValueError(f"truncation must be 'right' or 'filter', got {self.truncation}")
 
 
 def preprocess_sft_dataset(
     dataset: datasets.DatasetDict,
     map_fn: callable,
     output_dir: str,
+    max_length: int | None = None,
+    truncation: str = "right",
     remove_columns: bool = False,
     num_proc: int = 32,
 ):
@@ -53,6 +60,22 @@ def preprocess_sft_dataset(
         writer_batch_size=512,
         desc="offline preprocessing",
     )
+
+    # Apply truncation/filtering if max_length is specified
+    if max_length is not None:
+        before_train = len(processed["train"])
+        before_test = len(processed.get("test", [])) if "test" in processed else 0
+        processed = dllm.utils.post_process_dataset(
+            processed,
+            # Create a simple namespace with the required attributes
+            type("DataArgs", (), {"max_length": max_length, "truncation": truncation, "num_proc": num_proc})(),
+        )
+        after_train = len(processed["train"])
+        after_test = len(processed.get("test", [])) if "test" in processed else 0
+        if truncation == "filter":
+            print(f"[INFO] Filtered: train {before_train} -> {after_train}, test {before_test} -> {after_test}")
+        else:
+            print(f"[INFO] Truncated to max_length={max_length}: train={after_train}, test={after_test}")
 
     # Keep only the three required columns to save space.
     if remove_columns:
@@ -108,6 +131,8 @@ def main():
         dataset=dataset,
         map_fn=map_fn,
         output_dir=args.output_dir,
+        max_length=args.max_length,
+        truncation=args.truncation,
         remove_columns=args.remove_columns,
         num_proc=args.num_proc,
     )
