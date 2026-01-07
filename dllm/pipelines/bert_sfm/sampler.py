@@ -268,7 +268,8 @@ class BertSFMSampler(BaseSampler):
             alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
 
             # Compute soft embeddings from current sphere state
-            soft_embeddings = torch.matmul(x_sphere, embed_layer.weight)
+            x_probs = sphere_to_simplex(x_sphere)
+            soft_embeddings = torch.matmul(x_probs, embed_layer.weight)
 
             # Model forward pass
             t_batch = t_curr.expand(B)
