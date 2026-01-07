@@ -258,6 +258,9 @@ class BertSFMSampler(BaseSampler):
             init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
             histories.append(init_tokens.clone())
 
+        # Get discrete prompt embeddings (fixed throughout generation)
+        prompt_embeds = embed_layer(x_ids)  # (B, T, D)
+
         # Integration loop
         for step_idx in range(steps):
             t_curr = timesteps[step_idx]
@@ -267,13 +270,21 @@ class BertSFMSampler(BaseSampler):
             # Get schedule values
             alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
 
-            # Compute soft embeddings from current sphere state
+            # Compute soft embeddings from current sphere state for generation positions
             soft_embeddings = torch.matmul(x_sphere.to(embed_layer.weight.dtype), embed_layer.weight)
+
+            # Use discrete prompt embeddings for prompt positions, soft embeddings for generation
+            # This gives the model clear signal from the prompt while flowing the generation positions
+            combined_embeddings = torch.where(
+                gen_mask.unsqueeze(-1).expand_as(soft_embeddings),
+                soft_embeddings,
+                prompt_embeds,
+            )
 
             # Model forward pass
             t_batch = t_curr.expand(B)
             outputs = self.model(
-                inputs_embeds=soft_embeddings,
+                inputs_embeds=combined_embeddings,
                 attention_mask=attention_mask,
             )
             logits = outputs.logits  # (B, T, V)
@@ -413,6 +424,9 @@ class BertSFMSampler(BaseSampler):
             init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
             histories.append(init_tokens.clone())
 
+        # Get discrete embeddings for non-masked positions (fixed throughout)
+        context_embeds = embed_layer(x_ids)  # (B, T, D)
+
         # Integration loop
         for step_idx in range(steps):
             t_curr = timesteps[step_idx]
@@ -425,9 +439,16 @@ class BertSFMSampler(BaseSampler):
             # Compute soft embeddings from current sphere state
             soft_embeddings = torch.matmul(x_sphere.to(embed_layer.weight.dtype), embed_layer.weight)
 
+            # Use discrete embeddings for context, soft embeddings for masked positions
+            combined_embeddings = torch.where(
+                mask_positions.unsqueeze(-1).expand_as(soft_embeddings),
+                soft_embeddings,
+                context_embeds,
+            )
+
             # Model forward pass
             outputs = self.model(
-                inputs_embeds=soft_embeddings,
+                inputs_embeds=combined_embeddings,
                 attention_mask=attention_mask,
             )
             logits = outputs.logits
