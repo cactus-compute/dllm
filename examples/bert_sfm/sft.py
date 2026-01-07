@@ -103,6 +103,26 @@ def train():
             dataset = dllm.utils.post_process_dataset(dataset, data_args)
 
     # ----- Training --------------------------------------------------------------
+    # Patch LengthGroupedSampler to convert Arrow Column to list for fast sorting
+    # (Arrow Column index lookups are slow; dataset.data[col].to_pylist() is ~36x faster)
+    if training_args.group_by_length and "length" in dataset["train"].column_names:
+        from datasets.arrow_dataset import Column
+        from transformers.trainer_pt_utils import LengthGroupedSampler
+        _original_init = LengthGroupedSampler.__init__
+
+        def _patched_init(self, batch_size, *, dataset=None, lengths=None, **kwargs):
+            if lengths is not None and not isinstance(lengths, list):
+                if isinstance(lengths, Column):
+                    # Fast path: access underlying Arrow data directly
+                    lengths = dataset.data[lengths.column_name].to_pylist()
+                elif hasattr(lengths, "to_pylist"):
+                    lengths = lengths.to_pylist()
+                else:
+                    lengths = list(lengths)
+            _original_init(self, batch_size, dataset=dataset, lengths=lengths, **kwargs)
+
+        LengthGroupedSampler.__init__ = _patched_init
+
     accelerate.PartialState().wait_for_everyone()
     logger.info("Start training...")
     trainer = BertSFMTrainer(
