@@ -30,6 +30,70 @@ def simplex_to_sphere(p: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(p.clamp(min=1e-8))
 
 
+def geodesic_interpolant_to_onehot(
+    x_0: torch.Tensor, target_indices: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    """
+    Optimized geodesic interpolation when x_1 is a one-hot vector on the sphere.
+
+    When x_1 = e_k (one-hot at index k), the geodesic simplifies significantly.
+    On the sphere, sqrt(one-hot) = one-hot, so x_1[k] = 1 and x_1[j] = 0 for j != k.
+
+    The geodesic from x_0 to x_1 at time t is:
+        x_t = x_0 * cos(t * theta) + (x_1 - x_0 * cos(theta)) * sin(t * theta) / sin(theta)
+
+    where theta = arccos(x_0[k]) is the angle between x_0 and x_1.
+
+    Args:
+        x_0: Start point on sphere, shape (B, L, V)
+        target_indices: Indices of the one-hot targets, shape (B, L)
+        t: Interpolation parameter in [0, 1], shape (B,)
+
+    Returns:
+        Interpolated point on sphere, shape (B, L, V)
+    """
+    b, l, v = x_0.shape
+    dtype = x_0.dtype
+
+    # Expand t to (B, L, 1) for broadcasting, matching x_0's dtype
+    t = t.to(dtype).view(b, 1, 1).expand(b, l, 1)
+
+    # Get x_0's component at the target index: x_0[k] for each position
+    # This is cos(theta) where theta is the geodesic distance
+    x_0_at_target = x_0.gather(dim=-1, index=target_indices.unsqueeze(-1))  # (B, L, 1)
+    cos_theta = x_0_at_target.clamp(-1 + 1e-6, 1 - 1e-6)
+    theta = torch.acos(cos_theta).to(dtype)  # (B, L, 1)
+
+    # Compute sin values (cast back to dtype after trig ops)
+    sin_theta = torch.sin(theta).to(dtype).clamp(min=1e-8)
+    sin_t_theta = torch.sin(t * theta).to(dtype)
+    cos_t_theta = torch.cos(t * theta).to(dtype)
+
+    # x_t = x_0 * cos(t*theta) + direction * sin(t*theta)
+    # where direction = (x_1 - x_0 * cos(theta)) / sin(theta)
+    #
+    # For non-target indices j != k:
+    #   x_t[j] = x_0[j] * cos(t*theta) - x_0[j] * cos(theta) * sin(t*theta) / sin(theta)
+    #          = x_0[j] * (cos(t*theta) - cos(theta) * sin(t*theta) / sin(theta))
+    #
+    # For target index k:
+    #   x_t[k] = x_0[k] * cos(t*theta) + (1 - x_0[k] * cos(theta)) * sin(t*theta) / sin(theta)
+
+    # Coefficient for all positions (works for j != k)
+    coeff = cos_t_theta - cos_theta * sin_t_theta / sin_theta  # (B, L, 1)
+    x_t = x_0 * coeff  # (B, L, V)
+
+    # Correction for target index k: add (1 - x_0[k]*cos(theta)) * sin(t*theta) / sin(theta) - (existing contribution)
+    # Existing contribution at k: x_0[k] * coeff
+    # Correct value at k: x_0[k] * cos(t*theta) + (1 - x_0[k]*cos(theta)) * sin(t*theta) / sin(theta)
+    target_val = cos_theta * cos_t_theta + (1 - cos_theta * cos_theta) * sin_t_theta / sin_theta
+
+    # Scatter the correct value at target positions
+    x_t = x_t.scatter(dim=-1, index=target_indices.unsqueeze(-1), src=target_val)
+
+    return x_t
+
+
 def sphere_to_simplex(x: torch.Tensor) -> torch.Tensor:
     """Map sphere point back to simplex via squaring."""
     return x**2
@@ -325,28 +389,25 @@ class BertSFMTrainer(transformers.Trainer):
         # Get interpolation schedule
         alpha_t, alpha_t_prime = self._get_schedule(t)  # Both shape (B,)
 
-        # === 2. Convert tokens to manifold representation ===
-        # Create one-hot encoding of input tokens
-        x_1_onehot = F.one_hot(input_ids, num_classes=vocab_size).to(compute_dtype)  # [b, l, V]
-
-        # Map one-hot (simplex) to sphere
-        x_1 = simplex_to_sphere(x_1_onehot)  # [b, l, V]
-
-        # === 3. Sample noise from uniform prior on sphere ===
+        # === 2. Sample noise from uniform prior on sphere ===
         x_0 = uniform_prior((b, l, vocab_size), device=device, dtype=compute_dtype)  # [b, l, V]
 
-        # === 4. Geodesic interpolation ===
-        # alpha_t needs shape (B, 1, 1) for broadcasting with (B, L, V)
-        x_t = geodesic_interpolant(x_0, x_1, alpha_t)  # [b, l, V]
+        # === 3. Geodesic interpolation (optimized for one-hot targets) ===
+        # Since x_1 is always one-hot (sqrt of one-hot = one-hot on sphere),
+        # we use an optimized path that avoids materializing the full x_1 tensor
+        x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
 
-        # === 4b. Keep prompt positions clean (not noised) ===
-        # For positions where loss_mask=False (prompt), use the clean x_1 instead of x_t
+        # === 3b. Keep prompt positions clean (not noised) ===
+        # For positions where loss_mask=False (prompt), use the clean one-hot on sphere
         # This teaches the model to condition on clean prompts while denoising targets
-        x_t = torch.where(
-            loss_mask.unsqueeze(-1).expand_as(x_t),
-            x_t,  # Target positions: interpolated (noisy)
-            x_1,  # Prompt positions: clean one-hot on sphere
-        )
+        # Create one-hot only for prompt positions (much smaller if prompts are short)
+        if not loss_mask.all():
+            x_1_onehot = F.one_hot(input_ids, num_classes=vocab_size).to(compute_dtype)
+            x_t = torch.where(
+                loss_mask.unsqueeze(-1),
+                x_t,  # Target positions: interpolated (noisy)
+                x_1_onehot,  # Prompt positions: clean one-hot on sphere (sqrt(1)=1)
+            )
 
         # === 5. Forward pass ===
         # Compute soft embeddings: x_t @ embedding_matrix
