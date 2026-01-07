@@ -200,7 +200,7 @@ class BertSFMSampler(BaseSampler):
 
         device = self.model.device
         vocab_size = self.model.config.vocab_size
-        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 
         # Convert inputs to tensors
         if isinstance(inputs[0], list):
@@ -350,7 +350,7 @@ class BertSFMSampler(BaseSampler):
         device = self.model.device
         vocab_size = self.model.config.vocab_size
         mask_id = self.tokenizer.mask_token_id
-        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 
         # Convert inputs to tensors
         if isinstance(inputs[0], list):
