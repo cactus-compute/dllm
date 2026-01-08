@@ -148,6 +148,43 @@ def log_map(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return q_proj / q_proj_norm * dist
 
 
+def parallel_transport(p: torch.Tensor, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Parallel transport on the sphere.
+
+    Transport tangent vector v from tangent space at p to tangent space at q.
+
+    Args:
+        p: Source point on the sphere, shape (..., D)
+        q: Target point on the sphere, shape (..., D)
+        v: Tangent vector at p to transport, shape (..., D)
+
+    Returns:
+        Transported tangent vector at q, shape (..., D)
+    """
+    # Use the formula: v - <v, q> * (p + q) / (1 + <p, q>)
+    dot_pq = (p * q).sum(dim=-1, keepdim=True)
+    dot_vq = (v * q).sum(dim=-1, keepdim=True)
+    denom = 1.0 + dot_pq
+    return v - dot_vq * (p + q) / denom.clamp(min=1e-8)
+
+
+def make_tangent(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Project vector v onto the tangent space at point p on the sphere.
+
+    Args:
+        p: Point on the sphere, shape (..., D)
+        v: Vector to project, shape (..., D)
+
+    Returns:
+        Tangent vector at p, shape (..., D)
+    """
+    # Project: v - <p, v> * p
+    dot_pv = (p * v).sum(dim=-1, keepdim=True)
+    return v - dot_pv * p
+
+
 def geodesic_interpolant(
     x_0: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor
 ) -> torch.Tensor:
@@ -239,8 +276,8 @@ class BertSFMTrainer(transformers.Trainer):
     1. Maps one-hot targets to the positive orthant of the unit sphere
     2. Samples noise from a uniform prior on the same manifold
     3. Interpolates along geodesics between noise and data
-    4. Trains the model to predict the endpoint (data) from the interpolant
-    5. Uses cross-entropy loss against the true tokens
+    4. Trains the model to predict endpoint or velocity from the interpolant
+    5. Uses cross-entropy (endpoint) or MSE (velocity) loss
     """
 
     @dataclass
@@ -253,6 +290,7 @@ class BertSFMTrainer(transformers.Trainer):
         time_weight_min: float = 0.05  # Min clamp for time weighting
         time_weight_max: float = 1.5  # Max clamp for time weighting
         embed_type: str = "spherical"  # "spherical" or "simplex"
+        loss_type: str = "ce"  # "ce" (cross-entropy) or "mse" (velocity MSE)
         # Dataloader optimizations for better GPU utilization
         dataloader_num_workers: int = 8
         dataloader_pin_memory: bool = True
@@ -279,6 +317,7 @@ class BertSFMTrainer(transformers.Trainer):
         self.time_weight_min = args.time_weight_min
         self.time_weight_max = args.time_weight_max
         self.embed_type = args.embed_type
+        self.loss_type = args.loss_type
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -489,7 +528,10 @@ class BertSFMTrainer(transformers.Trainer):
         # Since x_1 is always one-hot (sqrt of one-hot = one-hot on sphere),
         # we use an optimized path that avoids materializing the full x_1 tensor
         x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
-        del x_0  # Free memory
+
+        # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
+        if self.loss_type == "ce":
+            del x_0
 
         # === 3b. Keep prompt positions clean (not noised) ===
         # For positions where loss_mask=False (prompt), use the clean one-hot on sphere
@@ -521,34 +563,55 @@ class BertSFMTrainer(transformers.Trainer):
         # === 6. Compute per-token loss weights ===
         loss_weights = self._compute_loss_weights(t, alpha_t, inputs)  # [b, l]
 
-        # === 7. Compute cross-entropy loss ===
-        # Target is the original tokens (endpoint prediction)
-        token_nll = F.cross_entropy(
-            logits.transpose(1, 2),  # [b, V, l]
-            input_ids,  # [b, l]
-            reduction="none",  # [b, l]
-        )
+        # === 7. Compute loss based on loss_type ===
+        if self.loss_type == "ce":
+            # Cross-entropy loss: target is the original tokens (endpoint prediction)
+            token_loss = F.cross_entropy(
+                logits.transpose(1, 2),  # [b, V, l]
+                input_ids,  # [b, l]
+                reduction="none",  # [b, l]
+            )
+        elif self.loss_type == "mse":
+            # Velocity MSE loss: target is the velocity (tangent vector)
+            # Construct x_1 (one-hot on sphere) for target positions
+            x_1 = F.one_hot(input_ids, num_classes=vocab_size).to(compute_dtype)  # [b, l, V]
+            # sqrt(one-hot) = one-hot on sphere
+
+            # Compute target velocity: log_map(x_0, x_1) parallel transported to x_t
+            # velocity at x_0 pointing toward x_1
+            velocity_at_x0 = log_map(x_0, x_1)  # [b, l, V]
+            # Parallel transport to x_t
+            target_velocity = parallel_transport(x_0, x_t, velocity_at_x0)  # [b, l, V]
+            del x_0, x_1, velocity_at_x0  # Free memory
+
+            # Project model output (logits) to tangent space at x_t
+            predicted_velocity = make_tangent(x_t, logits)  # [b, l, V]
+
+            # Compute MSE loss per token: sum over vocab dimension
+            token_loss = (predicted_velocity - target_velocity).square().sum(dim=-1)  # [b, l]
+        else:
+            raise ValueError(f"Invalid loss_type: {self.loss_type}")
 
         # Apply loss weights and mask
-        token_nll = token_nll * loss_weights * loss_mask.float()  # [b, l]
+        token_loss = token_loss * loss_weights * loss_mask.float()  # [b, l]
 
-        # Update metrics
+        # Update metrics (only meaningful for CE, but track for consistency)
         self.meter.update(
             split="train" if model.training else "eval",
-            value=token_nll.detach(),
+            value=token_loss.detach(),
             weight=loss_mask.float().detach(),
         )
 
         # === 8. Normalize loss ===
         if self.loss_norm_type == "token":
-            token_nll = token_nll / loss_mask.sum().clamp_min(1)
+            token_loss = token_loss / loss_mask.sum().clamp_min(1)
         elif self.loss_norm_type == "sequence":
-            token_nll = token_nll / (loss_mask.sum(-1, keepdim=True).clamp_min(1) * b)
+            token_loss = token_loss / (loss_mask.sum(-1, keepdim=True).clamp_min(1) * b)
         elif self.loss_norm_type == "batch":
-            token_nll = token_nll / b
+            token_loss = token_loss / b
         else:
             raise ValueError(f"Invalid loss_norm_type: {self.loss_norm_type}")
 
-        loss = token_nll.sum()
+        loss = token_loss.sum()
 
         return (loss, outputs) if return_outputs else loss

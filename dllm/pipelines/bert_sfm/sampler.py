@@ -72,6 +72,22 @@ def sphere_to_simplex(x: torch.Tensor) -> torch.Tensor:
     return x**2
 
 
+def make_tangent(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Project vector v onto the tangent space at point p on the sphere.
+
+    Args:
+        p: Point on the sphere, shape (..., D)
+        v: Vector to project, shape (..., D)
+
+    Returns:
+        Tangent vector at p, shape (..., D)
+    """
+    # Project: v - <p, v> * p
+    dot_pv = (p * v).sum(dim=-1, keepdim=True)
+    return v - dot_pv * p
+
+
 def uniform_prior(shape: tuple, device: torch.device) -> torch.Tensor:
     """
     Sample uniformly from positive orthant of the sphere.
@@ -137,6 +153,7 @@ class BertSFMSamplerConfig(SamplerConfig):
     schedule_nu: float = 1.0  # Parameter for cosine schedule
     inference_scaling: float = 1.0  # Scaling factor for step sizes
     embed_type: str = "spherical"  # "spherical" or "simplex"
+    prediction_type: str = "endpoint"  # "endpoint" (CE) or "velocity" (MSE)
 
 
 # ============== Sampler ==============
@@ -251,18 +268,31 @@ class BertSFMSampler(BaseSampler):
             if temperature > 0:
                 logits = logits / temperature
 
-            # Convert logits to probabilities and then to sphere
-            probs = F.softmax(logits, dim=-1)
-            x_1_pred = simplex_to_sphere(probs)
+            # Compute step based on prediction type
+            prediction_type = getattr(config, "prediction_type", "endpoint")
 
-            # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
-            step_weight = alpha_t_prime * dt / (1 - alpha_t + 1e-5)
-            step_weight = step_weight * inference_scaling
-            step_weight = step_weight.view(1, 1, 1)  # For broadcasting
+            if prediction_type == "endpoint":
+                # Endpoint prediction: logits -> probabilities -> sphere point
+                probs = F.softmax(logits, dim=-1)
+                x_1_pred = simplex_to_sphere(probs)
 
-            # Step along geodesic toward predicted endpoint
-            tangent = log_map(x_sphere, x_1_pred)
-            x_sphere_new = exp_map(x_sphere, tangent * step_weight)
+                # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
+                step_weight = alpha_t_prime * dt / (1 - alpha_t + 1e-5)
+                step_weight = step_weight * inference_scaling
+                step_weight = step_weight.view(1, 1, 1)  # For broadcasting
+
+                # Step along geodesic toward predicted endpoint
+                tangent = log_map(x_sphere, x_1_pred)
+                x_sphere_new = exp_map(x_sphere, tangent * step_weight)
+            elif prediction_type == "velocity":
+                # Velocity prediction: logits are raw velocity, project to tangent space
+                velocity = make_tangent(x_sphere, logits)
+
+                # Step directly with velocity: x_new = exp_map(x, v * dt)
+                x_sphere_new = exp_map(x_sphere, velocity * dt * inference_scaling)
+            else:
+                raise ValueError(f"Unknown prediction_type: {prediction_type}")
+
             x_sphere_new = project_to_sphere(x_sphere_new)
 
             # Only update flow positions; keep context positions fixed
