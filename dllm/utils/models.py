@@ -85,6 +85,7 @@ def get_tokenizer(model_args) -> transformers.PreTrainedTokenizer:
     # Lazy imports to avoid circular dependencies
     from transformers import (
         BertPreTrainedModel,
+        DebertaV2PreTrainedModel,
         ModernBertPreTrainedModel,
         RobertaPreTrainedModel,
     )
@@ -149,7 +150,7 @@ def get_tokenizer(model_args) -> transformers.PreTrainedTokenizer:
         tokenizer.eot_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eot_token)
     elif issubclass(
         model_cls,
-        (BertPreTrainedModel, RobertaPreTrainedModel, ModernBertPreTrainedModel),
+        (BertPreTrainedModel, DebertaV2PreTrainedModel, RobertaPreTrainedModel, ModernBertPreTrainedModel),
     ):
         tokenizer.eot_token = "[/Answer]"
         tokenizer.chat_template = """\
