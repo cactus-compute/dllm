@@ -137,5 +137,3 @@ dmypy.json
 /wandb/
 /logs/
 /models*/
-
-fisher-flow/
