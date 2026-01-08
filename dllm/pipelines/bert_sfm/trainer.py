@@ -436,13 +436,6 @@ class BertSFMTrainer(transformers.Trainer):
         # Apply loss weights and mask
         token_nll = token_nll * loss_weights * loss_mask.float()  # [b, l]
 
-        # Update metrics
-        self.meter.update(
-            split="train" if model.training else "eval",
-            value=token_nll.detach(),
-            weight=loss_mask.float().detach(),
-        )
-
         # === 8. Normalize loss ===
         if self.loss_norm_type == "token":
             token_nll = token_nll / loss_mask.sum().clamp_min(1)
@@ -454,5 +447,12 @@ class BertSFMTrainer(transformers.Trainer):
             raise ValueError(f"Invalid loss_norm_type: {self.loss_norm_type}")
 
         loss = token_nll.sum()
+
+        # Update metrics with normalized loss
+        self.meter.update(
+            split="train" if model.training else "eval",
+            value=loss.detach(),
+            weight=torch.tensor(1.0, device=device),
+        )
 
         return (loss, outputs) if return_outputs else loss
