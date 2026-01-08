@@ -396,18 +396,19 @@ class BertSFMTrainer(transformers.Trainer):
         # Since x_1 is always one-hot (sqrt of one-hot = one-hot on sphere),
         # we use an optimized path that avoids materializing the full x_1 tensor
         x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
+        del x_0  # Free memory
 
         # === 3b. Keep prompt positions clean (not noised) ===
         # For positions where loss_mask=False (prompt), use the clean one-hot on sphere
         # This teaches the model to condition on clean prompts while denoising targets
-        # Create one-hot only for prompt positions (much smaller if prompts are short)
+        # Use in-place operations to avoid allocating another [b, l, V] tensor
         if not loss_mask.all():
-            x_1_onehot = F.one_hot(input_ids, num_classes=vocab_size).to(compute_dtype)
-            x_t = torch.where(
-                loss_mask.unsqueeze(-1),
-                x_t,  # Target positions: interpolated (noisy)
-                x_1_onehot,  # Prompt positions: clean one-hot on sphere (sqrt(1)=1)
-            )
+            # Zero out prompt positions and scatter 1.0 at the correct token indices
+            prompt_mask = ~loss_mask  # positions to make clean
+            x_t[prompt_mask] = 0  # zero out prompt positions
+            # Scatter 1.0 at the target token index for prompt positions
+            prompt_indices = input_ids[prompt_mask].unsqueeze(-1)  # [num_prompt_tokens, 1]
+            x_t[prompt_mask] = x_t[prompt_mask].scatter(-1, prompt_indices, 1.0)
 
         # === 5. Forward pass ===
         # Compute soft embeddings: x_t @ embedding_matrix
