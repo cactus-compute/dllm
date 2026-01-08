@@ -136,6 +136,7 @@ class BertSFMSamplerConfig(SamplerConfig):
     schedule_type: str = "linear"  # "linear" or "cosine"
     schedule_nu: float = 1.0  # Parameter for cosine schedule
     inference_scaling: float = 1.0  # Scaling factor for step sizes
+    embed_type: str = "spherical"  # "spherical" or "simplex"
 
 
 # ============== Sampler ==============
@@ -227,8 +228,9 @@ class BertSFMSampler(BaseSampler):
             alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
 
             # Compute soft embeddings from current sphere state
+            x_embed = x_sphere if config.embed_type == "spherical" else sphere_to_simplex(x_sphere)
             soft_embeddings = torch.matmul(
-                x_sphere.to(embed_layer.weight.dtype), embed_layer.weight
+                x_embed.to(embed_layer.weight.dtype), embed_layer.weight
             )
 
             # Use discrete embeddings for context, soft embeddings for flow positions

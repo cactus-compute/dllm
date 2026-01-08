@@ -252,6 +252,7 @@ class BertSFMTrainer(transformers.Trainer):
         schedule_nu: float = 1.0  # Parameter for cosine schedule
         time_weight_min: float = 0.05  # Min clamp for time weighting
         time_weight_max: float = 1.5  # Max clamp for time weighting
+        embed_type: str = "spherical"  # "spherical" or "simplex"
         # Dataloader optimizations for better GPU utilization
         dataloader_num_workers: int = 8
         dataloader_pin_memory: bool = True
@@ -277,6 +278,7 @@ class BertSFMTrainer(transformers.Trainer):
         self.schedule_nu = args.schedule_nu
         self.time_weight_min = args.time_weight_min
         self.time_weight_max = args.time_weight_max
+        self.embed_type = args.embed_type
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -382,6 +384,7 @@ class BertSFMTrainer(transformers.Trainer):
             temperature=0.0,
             schedule_type=self.schedule_type,
             schedule_nu=self.schedule_nu,
+            embed_type=self.embed_type,
         )
 
         # Run flow integration (reuses the core loop)
@@ -501,9 +504,11 @@ class BertSFMTrainer(transformers.Trainer):
             x_t[prompt_mask] = x_t[prompt_mask].scatter(-1, prompt_indices, 1.0)
 
         # === 5. Forward pass ===
-        # Compute soft embeddings: x_t @ embedding_matrix
-        # x_t: [b, l, V], embed_weight: [V, D] -> [b, l, D]
-        soft_embeddings = torch.matmul(x_t, embed_layer.weight)
+        # Compute soft embeddings: x_embed @ embedding_matrix
+        # x_t is on sphere; convert to simplex if embed_type == "simplex"
+        x_embed = x_t if self.embed_type == "spherical" else sphere_to_simplex(x_t)
+        # x_embed: [b, l, V], embed_weight: [V, D] -> [b, l, D]
+        soft_embeddings = torch.matmul(x_embed, embed_layer.weight)
 
         # Forward pass with soft embeddings
         # Most HuggingFace models accept inputs_embeds
