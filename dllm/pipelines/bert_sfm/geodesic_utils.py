@@ -32,6 +32,28 @@ def exp_map(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return p * torch.cos(v_norm) + v * torch.sin(v_norm) / v_norm
 
 
+def exp_map_inplace(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Memory-efficient exponential map that reuses the v tensor.
+
+    Computes exp_map(p, v) but stores the result in v to save memory.
+    WARNING: This destroys the contents of v.
+
+    Args:
+        p: Point on the sphere, shape (..., D)
+        v: Tangent vector at p, shape (..., D) - WILL BE MODIFIED
+
+    Returns:
+        v tensor now containing the result (same memory location)
+    """
+    v_norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=1e-8)
+    sin_norm = torch.sin(v_norm)
+    cos_norm = torch.cos(v_norm)
+    # v = v * sin(||v||) / ||v|| + p * cos(||v||)
+    v.mul_(sin_norm).div_(v_norm).add_(p * cos_norm)
+    return v
+
+
 def log_map(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     """
     Logarithmic map on the sphere.
@@ -51,6 +73,31 @@ def log_map(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     dot_clamped = dot_pq.clamp(-1 + 1e-7, 1 - 1e-7)
     dist = torch.acos(dot_clamped)
     return q_proj / q_proj_norm * dist
+
+
+def log_map_inplace(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """
+    Memory-efficient logarithmic map that reuses the q tensor.
+
+    Computes log_map(p, q) but stores the result in q to save memory.
+    WARNING: This destroys the contents of q.
+
+    Args:
+        p: Source point on the sphere, shape (..., D)
+        q: Target point on the sphere, shape (..., D) - WILL BE MODIFIED
+
+    Returns:
+        q tensor now containing the tangent vector (same memory location)
+    """
+    dot_pq = (p * q).sum(dim=-1, keepdim=True)
+    # q_proj = q - dot_pq * p  (in-place)
+    q.sub_(dot_pq * p)
+    q_proj_norm = torch.norm(q, dim=-1, keepdim=True).clamp(min=1e-8)
+    dot_clamped = dot_pq.clamp(-1 + 1e-7, 1 - 1e-7)
+    dist = torch.acos(dot_clamped)
+    # q = q / ||q|| * dist  (in-place)
+    q.div_(q_proj_norm).mul_(dist)
+    return q
 
 
 def parallel_transport(p: torch.Tensor, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

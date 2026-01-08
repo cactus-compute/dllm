@@ -17,7 +17,9 @@ import torch.nn.functional as F
 from dllm.core.samplers.base import BaseSampler, SamplerConfig, SamplerOutput
 from dllm.pipelines.bert_sfm.geodesic_utils import (
     exp_map,
+    exp_map_inplace,
     log_map,
+    log_map_inplace,
     make_tangent,
     project_to_sphere,
     simplex_to_sphere,
@@ -92,6 +94,9 @@ class BertSFMSampler(BaseSampler):
 
         Integrates from t=0 to t=1, updating only positions where flow_mask=True.
 
+        This implementation is memory-optimized to minimize peak memory usage
+        by using in-place operations and explicitly deleting intermediate tensors.
+
         Args:
             x_sphere: Initial sphere state, shape (B, T, V). Positions where
                 flow_mask=True should be initialized from uniform prior.
@@ -119,6 +124,9 @@ class BertSFMSampler(BaseSampler):
         device = x_sphere.device
         timesteps = torch.linspace(0, 1, steps + 1, device=device)
 
+        # Pre-expand flow_mask once to avoid repeated expansion
+        flow_mask_expanded = flow_mask.unsqueeze(-1).expand_as(x_sphere)
+
         histories = []
         if return_histories:
             init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
@@ -140,7 +148,8 @@ class BertSFMSampler(BaseSampler):
             )
 
             # Use discrete embeddings for context, soft embeddings for flow positions
-            combined_embeddings = torch.where(
+            # Reuse soft_embeddings tensor for combined_embeddings
+            soft_embeddings = torch.where(
                 flow_mask.unsqueeze(-1).expand_as(soft_embeddings),
                 soft_embeddings,
                 context_embeds,
@@ -148,48 +157,60 @@ class BertSFMSampler(BaseSampler):
 
             # Model forward pass
             outputs = self.model(
-                inputs_embeds=combined_embeddings,
+                inputs_embeds=soft_embeddings,
                 attention_mask=attention_mask,
             )
+            del soft_embeddings  # Free embedding memory immediately
             logits = outputs.logits  # (B, T, V)
+            del outputs  # Free model output container
 
             # Apply temperature
             if temperature > 0:
-                logits = logits / temperature
+                logits.div_(temperature)  # In-place division
 
             # Compute step based on prediction type
             prediction_type = getattr(config, "prediction_type", "endpoint")
 
             if prediction_type == "endpoint":
                 # Endpoint prediction: logits -> probabilities -> sphere point
+                # Softmax then sqrt to get sphere point
                 probs = F.softmax(logits, dim=-1)
-                x_1_pred = simplex_to_sphere(probs)
+                del logits
+                # x_1_pred = sqrt(probs), in-place sqrt
+                x_1_pred = probs.sqrt_()
+                del probs  # Clean up reference (x_1_pred holds the data)
 
                 # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
-                step_weight = alpha_t_prime * dt / (1 - alpha_t + 1e-5)
-                step_weight = step_weight * inference_scaling
-                step_weight = step_weight.view(1, 1, 1)  # For broadcasting
+                step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5)) * inference_scaling
 
                 # Step along geodesic toward predicted endpoint
-                tangent = log_map(x_sphere, x_1_pred)
-                x_sphere_new = exp_map(x_sphere, tangent * step_weight)
+                # log_map_inplace stores result in x_1_pred (now becomes tangent)
+                tangent = log_map_inplace(x_sphere, x_1_pred)
+                # Scale tangent in-place
+                tangent.mul_(step_weight)
+                # exp_map_inplace stores result in tangent (now becomes x_sphere_new)
+                x_sphere_new = exp_map_inplace(x_sphere, tangent)
+                del tangent  # Clean up reference
+
             elif prediction_type == "velocity":
                 # Velocity prediction: logits are raw velocity, project to tangent space
                 velocity = make_tangent(x_sphere, logits)
+                del logits
 
-                # Step directly with velocity: x_new = exp_map(x, v * dt)
-                x_sphere_new = exp_map(x_sphere, velocity * dt * inference_scaling)
+                # Scale velocity in-place
+                velocity.mul_(dt * inference_scaling)
+                # exp_map_inplace stores result in velocity
+                x_sphere_new = exp_map_inplace(x_sphere, velocity)
+                del velocity
             else:
                 raise ValueError(f"Unknown prediction_type: {prediction_type}")
 
-            x_sphere_new = project_to_sphere(x_sphere_new)
+            # Project to sphere in-place
+            x_sphere_new.div_(torch.norm(x_sphere_new, dim=-1, keepdim=True).clamp(min=1e-8))
 
             # Only update flow positions; keep context positions fixed
-            x_sphere = torch.where(
-                flow_mask.unsqueeze(-1).expand_as(x_sphere),
-                x_sphere_new,
-                x_sphere,
-            )
+            x_sphere = torch.where(flow_mask_expanded, x_sphere_new, x_sphere)
+            del x_sphere_new
 
             if return_histories:
                 current_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
