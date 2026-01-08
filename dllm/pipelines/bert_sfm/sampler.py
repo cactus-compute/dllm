@@ -15,128 +15,17 @@ import torch
 import torch.nn.functional as F
 
 from dllm.core.samplers.base import BaseSampler, SamplerConfig, SamplerOutput
-
-# ============== Manifold Operations ==============
-
-
-def exp_map(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """
-    Exponential map on the sphere.
-
-    Move from point p in direction v (tangent vector) on the sphere.
-
-    Args:
-        p: Point on the sphere, shape (..., D)
-        v: Tangent vector at p, shape (..., D)
-
-    Returns:
-        New point on the sphere, shape (..., D)
-    """
-    v_norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=1e-8)
-    return p * torch.cos(v_norm) + v * torch.sin(v_norm) / v_norm
-
-
-def log_map(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """
-    Logarithmic map on the sphere.
-
-    Compute the tangent vector at p pointing toward q.
-
-    Args:
-        p: Source point on the sphere, shape (..., D)
-        q: Target point on the sphere, shape (..., D)
-
-    Returns:
-        Tangent vector at p, shape (..., D)
-    """
-    dot_pq = (p * q).sum(dim=-1, keepdim=True)
-    q_proj = q - dot_pq * p
-    q_proj_norm = torch.norm(q_proj, dim=-1, keepdim=True).clamp(min=1e-8)
-    dot_clamped = dot_pq.clamp(-1 + 1e-7, 1 - 1e-7)
-    dist = torch.acos(dot_clamped)
-    return q_proj / q_proj_norm * dist
-
-
-def project_to_sphere(x: torch.Tensor) -> torch.Tensor:
-    """Project to unit sphere for numerical stability."""
-    return x / torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-8)
-
-
-def simplex_to_sphere(p: torch.Tensor) -> torch.Tensor:
-    """Map probability simplex to sphere via square root."""
-    return torch.sqrt(p.clamp(min=1e-8))
-
-
-def sphere_to_simplex(x: torch.Tensor) -> torch.Tensor:
-    """Map sphere point back to simplex via squaring."""
-    return x**2
-
-
-def make_tangent(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """
-    Project vector v onto the tangent space at point p on the sphere.
-
-    Args:
-        p: Point on the sphere, shape (..., D)
-        v: Vector to project, shape (..., D)
-
-    Returns:
-        Tangent vector at p, shape (..., D)
-    """
-    # Project: v - <p, v> * p
-    dot_pv = (p * v).sum(dim=-1, keepdim=True)
-    return v - dot_pv * p
-
-
-def uniform_prior(shape: tuple, device: torch.device) -> torch.Tensor:
-    """
-    Sample uniformly from positive orthant of the sphere.
-
-    Args:
-        shape: Shape of output tensor, last dim is the manifold dimension
-        device: Device to create tensor on
-
-    Returns:
-        Points on positive orthant of unit sphere
-    """
-    x = torch.randn(shape, device=device).abs()
-    return x / torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-8)
-
-
-# ============== Interpolation Schedules ==============
-
-
-def linear_schedule(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Linear interpolation schedule.
-
-    Returns:
-        (alpha_t, alpha_t_prime): Interpolation value and its derivative
-    """
-    return t, torch.ones_like(t)
-
-
-def cosine_schedule(
-    t: torch.Tensor, nu: float = 1.0
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Cosine interpolation schedule.
-
-    Args:
-        t: Time values in [0, 1]
-        nu: Schedule parameter (default 1.0)
-
-    Returns:
-        (alpha_t, alpha_t_prime): Interpolation value and its derivative
-    """
-    import math
-
-    t_safe = t.clamp(min=1e-9)
-    alpha_t = 1 - torch.cos(math.pi / 2 * t_safe.pow(nu)).square()
-    alpha_t_prime = (
-        math.pi / 2 * torch.sin(math.pi * t_safe.pow(nu)) * nu * t_safe.pow(nu - 1)
-    )
-    return alpha_t, alpha_t_prime
+from dllm.pipelines.bert_sfm.geodesic_utils import (
+    exp_map,
+    log_map,
+    make_tangent,
+    project_to_sphere,
+    simplex_to_sphere,
+    sphere_to_simplex,
+    uniform_prior,
+    linear_schedule,
+    cosine_schedule,
+)
 
 
 # ============== Sampler Config ==============

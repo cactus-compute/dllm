@@ -43,9 +43,10 @@ sample = dataset[0]
 print(f"Input IDs: {sample['input_ids'].tolist()}")
 print(f"Decoded: {tokenizer.decode(sample['input_ids'])}")
 
-# Train
-args = BertSFMTrainer.BertSFMConfig(
-    output_dir="/tmp/test_bert_sfm",
+# Train with CE loss (default)
+print("\n=== Training with CE Loss (endpoint prediction) ===")
+args_ce = BertSFMTrainer.BertSFMConfig(
+    output_dir="/tmp/test_bert_sfm_ce",
     per_device_train_batch_size=20,
     num_train_epochs=10,
     learning_rate=5e-3,
@@ -55,11 +56,12 @@ args = BertSFMTrainer.BertSFMConfig(
     eval_strategy="no",
     use_cpu=True,
     dataloader_num_workers=0,
+    loss_type="ce",
 )
 
-trainer = BertSFMTrainer(
+trainer_ce = BertSFMTrainer(
     model=model,
-    args=args,
+    args=args_ce,
     tokenizer=tokenizer,
     train_dataset=dataset,
     data_collator=transformers.DataCollatorForSeq2Seq(
@@ -67,22 +69,65 @@ trainer = BertSFMTrainer(
     ),
 )
 
-print("\n=== Training ===")
-result = trainer.train()
-print(f"Final loss: {result.training_loss:.4f}")
+result_ce = trainer_ce.train()
+print(f"Final CE loss: {result_ce.training_loss:.4f}")
 
-# Test sampling
-print("\n=== Testing Sampling ===")
+# Train with MSE loss (velocity prediction)
+print("\n=== Training with MSE Loss (velocity prediction) ===")
+model_mse = transformers.AutoModelForMaskedLM.from_pretrained(model_name)
+
+args_mse = BertSFMTrainer.BertSFMConfig(
+    output_dir="/tmp/test_bert_sfm_mse",
+    per_device_train_batch_size=20,
+    num_train_epochs=10,
+    learning_rate=1e-4,  # Lower LR for MSE (larger gradients)
+    logging_steps=5,
+    save_strategy="no",
+    report_to="none",
+    eval_strategy="no",
+    use_cpu=True,
+    dataloader_num_workers=0,
+    loss_type="mse",
+)
+
+trainer_mse = BertSFMTrainer(
+    model=model_mse,
+    args=args_mse,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    data_collator=transformers.DataCollatorForSeq2Seq(
+        tokenizer, return_tensors="pt", padding=True
+    ),
+)
+
+result_mse = trainer_mse.train()
+print(f"Final MSE loss: {result_mse.training_loss:.4f}")
+
+# Test sampling with CE-trained model (endpoint prediction)
+print("\n=== Testing Sampling (CE model, endpoint prediction) ===")
 model.eval()
-sampler = BertSFMSampler(model=model, tokenizer=tokenizer)
+sampler_ce = BertSFMSampler(model=model, tokenizer=tokenizer)
 
 test_text = "The [MASK] sat on the [MASK]."
 inputs = tokenizer(test_text, return_tensors="pt")
 print(f"Input: {test_text}")
 
 for steps in [20, 50]:
-    config = BertSFMSamplerConfig(steps=steps, temperature=0.0)
-    output = sampler.infill([inputs["input_ids"][0]], config=config)
+    config = BertSFMSamplerConfig(steps=steps, temperature=0.0, prediction_type="endpoint")
+    output = sampler_ce.infill([inputs["input_ids"][0]], config=config)
+    output_ids = output.sequences[0] if hasattr(output, "sequences") else output[0]
+    output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+    print(f"Steps={steps:3d}: {output_text}")
+
+# Test sampling with MSE-trained model (velocity prediction)
+print("\n=== Testing Sampling (MSE model, velocity prediction) ===")
+model_mse.eval()
+sampler_mse = BertSFMSampler(model=model_mse, tokenizer=tokenizer)
+print(f"Input: {test_text}")
+
+for steps in [20, 50]:
+    config = BertSFMSamplerConfig(steps=steps, temperature=0.0, prediction_type="velocity")
+    output = sampler_mse.infill([inputs["input_ids"][0]], config=config)
     output_ids = output.sequences[0] if hasattr(output, "sequences") else output[0]
     output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
     print(f"Steps={steps:3d}: {output_text}")
@@ -109,7 +154,7 @@ for i, pos in enumerate(mask_pos.nonzero().squeeze().tolist()):
 # Test with soft embedding input (like training)
 print("\n=== Test with soft embeddings (like training) ===")
 import torch.nn.functional as F
-from dllm.pipelines.bert_sfm.sampler import simplex_to_sphere, sphere_to_simplex
+from dllm.pipelines.bert_sfm.geodesic_utils import simplex_to_sphere, sphere_to_simplex
 
 # Get embedding layer
 embed_layer = model.get_input_embeddings()
