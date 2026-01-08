@@ -131,7 +131,7 @@ class BertSFMSamplerConfig(SamplerConfig):
     """Configuration for Fisher-Rao Flow Matching sampler."""
 
     max_new_tokens: int = 128
-    steps: int = 100
+    steps: int = 20  # 20 timesteps for SFT evaluation
     temperature: float = 0.0
     schedule_type: str = "linear"  # "linear" or "cosine"
     schedule_nu: float = 1.0  # Parameter for cosine schedule
@@ -166,6 +166,115 @@ class BertSFMSampler(BaseSampler):
             return cosine_schedule(t, nu=config.schedule_nu)
         else:
             raise ValueError(f"Unknown schedule_type: {config.schedule_type}")
+
+    @torch.no_grad()
+    def flow_integrate(
+        self,
+        x_sphere: torch.Tensor,
+        flow_mask: torch.Tensor,
+        context_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        config: BertSFMSamplerConfig,
+        steps: int,
+        temperature: float,
+        inference_scaling: float,
+        return_histories: bool = False,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """
+        Core flow integration loop on the Fisher-Rao manifold.
+
+        Integrates from t=0 to t=1, updating only positions where flow_mask=True.
+
+        Args:
+            x_sphere: Initial sphere state, shape (B, T, V). Positions where
+                flow_mask=True should be initialized from uniform prior.
+            flow_mask: Boolean mask indicating which positions to flow (B, T).
+                True = flow from noise, False = keep fixed.
+            context_embeds: Discrete embeddings for context positions (B, T, D).
+            attention_mask: Attention mask for the model (B, T).
+            config: Sampler configuration.
+            steps: Number of integration steps.
+            temperature: Temperature for logits (0 = greedy).
+            inference_scaling: Scaling factor for step sizes.
+            return_histories: Whether to record token history at each step.
+
+        Returns:
+            Tuple of (final_x_sphere, histories) where histories is None if
+            return_histories=False.
+        """
+        # Get embedding layer
+        if hasattr(self.model, "get_input_embeddings"):
+            embed_layer = self.model.get_input_embeddings()
+        else:
+            embed_layer = self.model.model.embed_tokens
+
+        # Time grid from 0 to 1
+        device = x_sphere.device
+        timesteps = torch.linspace(0, 1, steps + 1, device=device)
+
+        histories = []
+        if return_histories:
+            init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
+            histories.append(init_tokens.clone())
+
+        # Integration loop
+        for step_idx in range(steps):
+            t_curr = timesteps[step_idx]
+            t_next = timesteps[step_idx + 1]
+            dt = t_next - t_curr
+
+            # Get schedule values
+            alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
+
+            # Compute soft embeddings from current sphere state
+            soft_embeddings = torch.matmul(
+                x_sphere.to(embed_layer.weight.dtype), embed_layer.weight
+            )
+
+            # Use discrete embeddings for context, soft embeddings for flow positions
+            combined_embeddings = torch.where(
+                flow_mask.unsqueeze(-1).expand_as(soft_embeddings),
+                soft_embeddings,
+                context_embeds,
+            )
+
+            # Model forward pass
+            outputs = self.model(
+                inputs_embeds=combined_embeddings,
+                attention_mask=attention_mask,
+            )
+            logits = outputs.logits  # (B, T, V)
+
+            # Apply temperature
+            if temperature > 0:
+                logits = logits / temperature
+
+            # Convert logits to probabilities and then to sphere
+            probs = F.softmax(logits, dim=-1)
+            x_1_pred = simplex_to_sphere(probs)
+
+            # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
+            step_weight = alpha_t_prime * dt / (1 - alpha_t + 1e-5)
+            step_weight = step_weight * inference_scaling
+            step_weight = step_weight.view(1, 1, 1)  # For broadcasting
+
+            # Step along geodesic toward predicted endpoint
+            tangent = log_map(x_sphere, x_1_pred)
+            x_sphere_new = exp_map(x_sphere, tangent * step_weight)
+            x_sphere_new = project_to_sphere(x_sphere_new)
+
+            # Only update flow positions; keep context positions fixed
+            x_sphere = torch.where(
+                flow_mask.unsqueeze(-1).expand_as(x_sphere),
+                x_sphere_new,
+                x_sphere,
+            )
+
+            if return_histories:
+                current_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
+                histories.append(current_tokens.clone())
+
+        return x_sphere, histories if return_histories else None
 
     @torch.no_grad()
     def sample(
@@ -236,10 +345,7 @@ class BertSFMSampler(BaseSampler):
         else:
             embed_layer = self.model.model.embed_tokens
 
-        # Initialize generation positions from prior on the sphere
-        # Shape: (B, T, V) - but only generation positions matter
-        x_sphere = torch.zeros((B, T, vocab_size), device=device)
-
+        # Initialize sphere state
         # For prompt positions: use one-hot encoding mapped to sphere
         prompt_onehot = F.one_hot(x_ids, num_classes=vocab_size).float()
         x_sphere = simplex_to_sphere(prompt_onehot)
@@ -249,75 +355,21 @@ class BertSFMSampler(BaseSampler):
         for i, pl in enumerate(prompt_lens):
             x_sphere[i, pl : pl + max_new_tokens] = gen_prior[i, :max_new_tokens]
 
-        # Time grid from 0 to 1
-        timesteps = torch.linspace(0, 1, steps + 1, device=device)
-
-        histories = []
-        if return_dict:
-            # Record initial state
-            init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
-            histories.append(init_tokens.clone())
-
         # Get discrete prompt embeddings (fixed throughout generation)
-        prompt_embeds = embed_layer(x_ids)  # (B, T, D)
+        context_embeds = embed_layer(x_ids)  # (B, T, D)
 
-        # Integration loop
-        for step_idx in range(steps):
-            t_curr = timesteps[step_idx]
-            t_next = timesteps[step_idx + 1]
-            dt = t_next - t_curr
-
-            # Get schedule values
-            alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
-
-            # Compute soft embeddings from current sphere state for generation positions
-            soft_embeddings = torch.matmul(x_sphere.to(embed_layer.weight.dtype), embed_layer.weight)
-
-            # Use discrete prompt embeddings for prompt positions, soft embeddings for generation
-            # This gives the model clear signal from the prompt while flowing the generation positions
-            combined_embeddings = torch.where(
-                gen_mask.unsqueeze(-1).expand_as(soft_embeddings),
-                soft_embeddings,
-                prompt_embeds,
-            )
-
-            # Model forward pass
-            t_batch = t_curr.expand(B)
-            outputs = self.model(
-                inputs_embeds=combined_embeddings,
-                attention_mask=attention_mask,
-            )
-            logits = outputs.logits  # (B, T, V)
-
-            # Apply temperature
-            if temperature > 0:
-                logits = logits / temperature
-
-            # Convert logits to probabilities and then to sphere
-            probs = F.softmax(logits, dim=-1)
-            x_1_pred = simplex_to_sphere(probs)
-
-            # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
-            step_weight = alpha_t_prime * dt / (1 - alpha_t + 1e-5)
-            step_weight = step_weight * inference_scaling
-            step_weight = step_weight.view(1, 1, 1)  # For broadcasting
-
-            # Step along geodesic toward predicted endpoint
-            tangent = log_map(x_sphere, x_1_pred)
-            x_sphere_new = exp_map(x_sphere, tangent * step_weight)
-            x_sphere_new = project_to_sphere(x_sphere_new)
-
-            # Only update generation positions; keep prompt positions fixed
-            x_sphere = torch.where(
-                gen_mask.unsqueeze(-1).expand_as(x_sphere),
-                x_sphere_new,
-                x_sphere,
-            )
-
-            if return_dict:
-                # Record current tokens
-                current_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
-                histories.append(current_tokens.clone())
+        # Run flow integration
+        x_sphere, histories = self.flow_integrate(
+            x_sphere=x_sphere,
+            flow_mask=gen_mask,
+            context_embeds=context_embeds,
+            attention_mask=attention_mask,
+            config=config,
+            steps=steps,
+            temperature=temperature,
+            inference_scaling=inference_scaling,
+            return_histories=return_dict,
+        )
 
         # Convert final sphere points to tokens
         final_probs = sphere_to_simplex(x_sphere)
@@ -397,10 +449,6 @@ class BertSFMSampler(BaseSampler):
             embed_layer = self.model.model.embed_tokens
 
         # Initialize sphere representation
-        # For non-masked positions: use one-hot encoding mapped to sphere
-        # For masked positions: sample from uniform prior
-        x_sphere = torch.zeros((B, T, vocab_size), device=device)
-
         # Non-masked positions: one-hot -> sphere
         non_mask_onehot = F.one_hot(
             torch.where(mask_positions, torch.zeros_like(x_ids), x_ids),
@@ -416,71 +464,21 @@ class BertSFMSampler(BaseSampler):
             x_sphere,
         )
 
-        # Time grid
-        timesteps = torch.linspace(0, 1, steps + 1, device=device)
-
-        histories = []
-        if return_dict:
-            init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
-            histories.append(init_tokens.clone())
-
         # Get discrete embeddings for non-masked positions (fixed throughout)
         context_embeds = embed_layer(x_ids)  # (B, T, D)
 
-        # Integration loop
-        for step_idx in range(steps):
-            t_curr = timesteps[step_idx]
-            t_next = timesteps[step_idx + 1]
-            dt = t_next - t_curr
-
-            # Get schedule values
-            alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
-
-            # Compute soft embeddings from current sphere state
-            soft_embeddings = torch.matmul(x_sphere.to(embed_layer.weight.dtype), embed_layer.weight)
-
-            # Use discrete embeddings for context, soft embeddings for masked positions
-            combined_embeddings = torch.where(
-                mask_positions.unsqueeze(-1).expand_as(soft_embeddings),
-                soft_embeddings,
-                context_embeds,
-            )
-
-            # Model forward pass
-            outputs = self.model(
-                inputs_embeds=combined_embeddings,
-                attention_mask=attention_mask,
-            )
-            logits = outputs.logits
-
-            # Apply temperature
-            if temperature > 0:
-                logits = logits / temperature
-
-            # Convert to sphere
-            probs = F.softmax(logits, dim=-1)
-            x_1_pred = simplex_to_sphere(probs)
-
-            # Compute step weight
-            step_weight = alpha_t_prime * dt / (1 - alpha_t + 1e-5)
-            step_weight = step_weight * inference_scaling
-            step_weight = step_weight.view(1, 1, 1)
-
-            # Geodesic step
-            tangent = log_map(x_sphere, x_1_pred)
-            x_sphere_new = exp_map(x_sphere, tangent * step_weight)
-            x_sphere_new = project_to_sphere(x_sphere_new)
-
-            # Only update masked positions
-            x_sphere = torch.where(
-                mask_positions.unsqueeze(-1).expand_as(x_sphere),
-                x_sphere_new,
-                x_sphere,
-            )
-
-            if return_dict:
-                current_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
-                histories.append(current_tokens.clone())
+        # Run flow integration
+        x_sphere, histories = self.flow_integrate(
+            x_sphere=x_sphere,
+            flow_mask=mask_positions,
+            context_embeds=context_embeds,
+            attention_mask=attention_mask,
+            config=config,
+            steps=steps,
+            temperature=temperature,
+            inference_scaling=inference_scaling,
+            return_histories=return_dict,
+        )
 
         # Convert final sphere points to tokens
         final_probs = sphere_to_simplex(x_sphere)

@@ -20,6 +20,13 @@ import transformers
 from dllm.core.schedulers import BaseAlphaScheduler, LinearAlphaScheduler
 from dllm.utils.configs import TrainingArguments
 from dllm.core.trainers.utils import NLLMetric, PPLMetric, OnEvaluateMetricsCallback
+from dllm.pipelines.bert_sfm.sampler import (
+    BertSFMSampler,
+    BertSFMSamplerConfig,
+    simplex_to_sphere,
+    sphere_to_simplex,
+    uniform_prior,
+)
 
 
 # ============== Manifold Operations ==============
@@ -324,19 +331,98 @@ class BertSFMTrainer(transformers.Trainer):
 
     @torch.no_grad()
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+        """
+        Evaluation via full flow integration from t=0 to t=1 using the sampler.
+
+        Uses BertSFMSampler.flow_integrate() to:
+        1. Start from pure noise (t=0) for response positions, clean one-hot for prompt
+        2. Integrate over 20 timesteps using Euler integration on the manifold
+        3. Compute PPL on the final generated distribution vs ground truth
+        """
+
+        input_ids = inputs["input_ids"]
+        labels = inputs["labels"]
+        attention_mask = inputs.get("attention_mask", None)
+
+        b, l = input_ids.shape
+        unwrapped_model = model.module if hasattr(model, "module") else model
+        vocab_size = unwrapped_model.config.vocab_size
+        device = input_ids.device
+
+        # Positions where we compute loss (response positions, not prompt)
+        loss_mask = labels != -100  # [b, l]
+
+        # Get embedding layer
+        if hasattr(model, "get_input_embeddings"):
+            embed_layer = model.get_input_embeddings()
+        else:
+            embed_layer = model.model.embed_tokens
+
+        # Initialize sphere state
+        # Prompt positions: clean one-hot on sphere
+        # Response positions: uniform prior (noise)
+        prompt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
+        x_sphere = simplex_to_sphere(prompt_onehot)
+
+        # Replace response positions with uniform prior
+        prior_sample = uniform_prior((b, l, vocab_size), device=device)
+        x_sphere = torch.where(
+            loss_mask.unsqueeze(-1).expand_as(x_sphere),
+            prior_sample,
+            x_sphere,
+        )
+
+        # Get discrete embeddings for context positions
+        context_embeds = embed_layer(input_ids)
+
+        # Use sampler to do flow integration
+        sampler = BertSFMSampler(model=model, tokenizer=self.processing_class)
+        config = BertSFMSamplerConfig(
+            steps=20,
+            temperature=0.0,
+            schedule_type=self.schedule_type,
+            schedule_nu=self.schedule_nu,
+        )
+
+        # Run flow integration (reuses the core loop)
+        x_sphere, _ = sampler.flow_integrate(
+            x_sphere=x_sphere,
+            flow_mask=loss_mask,
+            context_embeds=context_embeds,
+            attention_mask=attention_mask,
+            config=config,
+            steps=20,
+            temperature=0.0,
+            inference_scaling=1.0,
+            return_histories=False,
+        )
+
+        # Convert final sphere state to probabilities for PPL
+        final_probs = sphere_to_simplex(x_sphere)  # [b, l, V]
+        final_logits = torch.log(final_probs.clamp(min=1e-10))
+
+        # Compute cross-entropy loss on response positions only
+        token_nll = F.cross_entropy(
+            final_logits.transpose(1, 2),  # [b, V, l]
+            input_ids,  # [b, l]
+            reduction="none",  # [b, l]
+        )
+        token_nll = token_nll * loss_mask.float()
+
+        # Update metrics
+        self.meter.update(
+            split="eval",
+            value=token_nll.detach(),
+            weight=loss_mask.float().detach(),
+        )
+
+        # Normalize loss
+        loss = token_nll.sum() / loss_mask.sum().clamp_min(1)
+
         if prediction_loss_only:
             return (loss.detach(), None, None)
 
-        logits = getattr(outputs, "logits", outputs)
-        if isinstance(logits, torch.Tensor):
-            logits = logits.detach().contiguous()
-
-        labels = inputs.get("labels")
-        if isinstance(labels, torch.Tensor):
-            labels = labels.detach().contiguous()
-
-        return (loss.detach(), logits, labels)
+        return (loss.detach(), final_logits.detach().contiguous(), labels.detach().contiguous())
 
     def compute_loss(
         self,
