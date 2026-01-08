@@ -245,6 +245,10 @@ class BertSFMTrainer(transformers.Trainer):
         schedule_nu: float = 1.0  # Parameter for cosine schedule
         time_weight_min: float = 0.05  # Min clamp for time weighting
         time_weight_max: float = 1.5  # Max clamp for time weighting
+        # Dataloader optimizations for better GPU utilization
+        dataloader_num_workers: int = 8
+        dataloader_pin_memory: bool = True
+        dataloader_prefetch_factor: int = 2
 
     def __init__(
         self,
