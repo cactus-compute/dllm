@@ -345,10 +345,11 @@ class BertSFMTrainer(transformers.Trainer):
         loss_mask = labels != -100  # [b, l]
 
         # Get the embedding layer and its dtype (set by accelerate/deepspeed mixed precision)
-        if hasattr(model, "get_input_embeddings"):
-            embed_layer = model.get_input_embeddings()
+        # Use unwrapped_model to handle DDP wrapper
+        if hasattr(unwrapped_model, "get_input_embeddings"):
+            embed_layer = unwrapped_model.get_input_embeddings()
         else:
-            embed_layer = model.model.embed_tokens
+            embed_layer = unwrapped_model.model.embed_tokens
         compute_dtype = embed_layer.weight.dtype
 
         # === 1. Sample diffusion timesteps ===
