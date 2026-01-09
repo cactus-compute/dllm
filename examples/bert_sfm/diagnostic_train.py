@@ -148,7 +148,7 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         context_embeds = embed_layer(input_ids)
 
         # Manual flow integration with per-step logging
-        steps = 20
+        steps = self.eval_integration_steps
         timesteps = torch.linspace(0, 1, steps + 1, device=device)
         step_losses = []
         step_distances = []
