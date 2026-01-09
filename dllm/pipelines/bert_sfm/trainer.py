@@ -125,6 +125,7 @@ class BertSFMTrainer(transformers.Trainer):
         time_weight_max: float = 1.5  # Max clamp for time weighting
         embed_type: str = "spherical"  # "spherical" or "simplex"
         loss_type: str = "ce"  # "ce" (cross-entropy) or "mse" (velocity MSE)
+        eval_integration_steps: int = 20  # Number of integration steps for evaluation
         # Dataloader optimizations - defaults set based on CUDA availability
         dataloader_num_workers: int = 8 if torch.cuda.is_available() else 0
         dataloader_pin_memory: bool = torch.cuda.is_available()
@@ -156,6 +157,7 @@ class BertSFMTrainer(transformers.Trainer):
         self.time_weight_max = args.time_weight_max
         self.embed_type = args.embed_type
         self.loss_type = args.loss_type
+        self.eval_integration_steps = args.eval_integration_steps
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -260,7 +262,7 @@ class BertSFMTrainer(transformers.Trainer):
         # Use sampler to do flow integration
         sampler = BertSFMSampler(model=model, tokenizer=self.processing_class)
         config = BertSFMSamplerConfig(
-            steps=20,
+            steps=self.eval_integration_steps,
             temperature=0.0,
             schedule_type=self.schedule_type,
             schedule_nu=self.schedule_nu,
@@ -274,7 +276,7 @@ class BertSFMTrainer(transformers.Trainer):
             context_embeds=context_embeds,
             attention_mask=attention_mask,
             config=config,
-            steps=20,
+            steps=self.eval_integration_steps,
             temperature=0.0,
             inference_scaling=1.0,
             return_histories=False,
