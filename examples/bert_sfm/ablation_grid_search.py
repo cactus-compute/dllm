@@ -98,9 +98,16 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
         return {"error": str(e)}
 
     # Parse trainer_state.json for metrics
+    # Look in multiple locations: root, checkpoint-final, or latest numbered checkpoint
     trainer_state_path = Path(output_dir) / "trainer_state.json"
     if not trainer_state_path.exists():
         trainer_state_path = Path(output_dir) / "checkpoint-final" / "trainer_state.json"
+    if not trainer_state_path.exists():
+        # Find the highest numbered checkpoint
+        checkpoints = sorted(Path(output_dir).glob("checkpoint-[0-9]*"),
+                           key=lambda p: int(p.name.split("-")[1]))
+        if checkpoints:
+            trainer_state_path = checkpoints[-1] / "trainer_state.json"
 
     if not trainer_state_path.exists():
         print(f"No trainer_state.json found")
