@@ -41,6 +41,7 @@ FIXED_PARAMS = {
     "per_device_train_batch_size": 32,
     "per_device_eval_batch_size": 16,
     "group_by_length": "true",
+    "save_only_model": "false",
 }
 
 # Output directory base
@@ -66,6 +67,7 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
         "--per_device_train_batch_size", str(FIXED_PARAMS["per_device_train_batch_size"]),
         "--per_device_eval_batch_size", str(FIXED_PARAMS["per_device_eval_batch_size"]),
         "--group_by_length", FIXED_PARAMS["group_by_length"],
+        "--save_only_model", FIXED_PARAMS["save_only_model"],
         "--learning_rate", str(params["learning_rate"]),
         "--embed_type", params["embed_type"],
         "--loss_type", params["loss_type"],
