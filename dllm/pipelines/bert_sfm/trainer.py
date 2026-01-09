@@ -439,15 +439,15 @@ class BertSFMTrainer(transformers.Trainer):
         else:
             raise ValueError(f"Invalid loss_type: {self.loss_type}")
 
-        # Apply loss weights and mask
-        token_loss = token_loss * loss_weights * loss_mask.float()  # [b, l]
-
-        # Update metrics (only meaningful for CE, but track for consistency)
+        # Update metrics with raw loss (before weighting) for accurate tracking
         self.meter.update(
             split="train" if model.training else "eval",
-            value=token_loss.detach(),
+            value=(token_loss * loss_mask.float()).detach(),
             weight=loss_mask.float().detach(),
         )
+
+        # Apply loss weights and mask for backprop
+        token_loss = token_loss * loss_weights * loss_mask.float()  # [b, l]
 
         # === 8. Normalize loss ===
         if self.loss_norm_type == "token":

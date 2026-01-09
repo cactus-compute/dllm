@@ -123,48 +123,29 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
     # Extract metrics from log_history
     log_history = state.get("log_history", [])
 
-    # Find eval entries and train entries
     eval_entries = [e for e in log_history if "eval_loss" in e]
-    train_entries = [e for e in log_history if "loss" in e and "eval_loss" not in e]
+    # nll logged separately by meter callback (raw loss before weighting)
+    train_nll_entries = [e for e in log_history if "nll" in e and "eval_nll" not in e]
 
     if not eval_entries:
         print("No eval entries found")
         return {"error": "No eval entries"}
 
-    # Get best eval loss and corresponding step
-    best_eval_entry = min(eval_entries, key=lambda e: e.get("eval_loss", float("inf")))
-    best_eval_step = best_eval_entry.get("step", 0)
+    # Get best eval loss (NLL from 20-step integration, comparable across all configs)
+    best_eval = min(eval_entries, key=lambda e: e.get("eval_loss", float("inf")))
+    best_step = best_eval.get("step", 0)
 
-    # Get final eval entry
-    final_eval_entry = eval_entries[-1]
-    final_eval_step = final_eval_entry.get("step", 0)
-
-    # Find train loss at the same steps (closest)
-    def get_train_loss_at_step(step):
-        if not train_entries:
-            return None
-        closest = min(train_entries, key=lambda e: abs(e.get("step", 0) - step))
-        return closest.get("loss")
+    # Get train nll at best step (raw loss before weighting, from meter)
+    train_nll = None
+    if train_nll_entries:
+        closest = min(train_nll_entries, key=lambda e: abs(e.get("step", 0) - best_step))
+        train_nll = closest.get("nll")
 
     metrics = {
-        "best_eval_loss": best_eval_entry.get("eval_loss"),
-        "best_eval_nll": best_eval_entry.get("eval_nll"),
-        "best_eval_ppl": best_eval_entry.get("eval_ppl"),
-        "best_eval_step": best_eval_step,
-        "train_loss_at_best_eval": get_train_loss_at_step(best_eval_step),
-        "final_eval_loss": final_eval_entry.get("eval_loss"),
-        "final_eval_nll": final_eval_entry.get("eval_nll"),
-        "final_eval_ppl": final_eval_entry.get("eval_ppl"),
-        "final_eval_step": final_eval_step,
-        "train_loss_at_final_eval": get_train_loss_at_step(final_eval_step),
+        "best_eval_loss": best_eval.get("eval_loss"),
+        "best_step": best_step,
+        "train_nll": train_nll,
     }
-
-    # Also get train nll/ppl if available
-    if train_entries:
-        last_train = train_entries[-1]
-        metrics["final_train_loss"] = last_train.get("loss")
-        metrics["final_train_nll"] = last_train.get("nll")
-        metrics["final_train_ppl"] = last_train.get("ppl")
 
     print(f"Done: best_eval_loss={metrics.get('best_eval_loss', 'N/A')}")
     return metrics
@@ -192,18 +173,8 @@ def main():
         "schedule_type",
         "loss_weight_type",
         "best_eval_loss",
-        "best_eval_nll",
-        "best_eval_ppl",
-        "best_eval_step",
-        "train_loss_at_best_eval",
-        "final_eval_loss",
-        "final_eval_nll",
-        "final_eval_ppl",
-        "final_eval_step",
-        "train_loss_at_final_eval",
-        "final_train_loss",
-        "final_train_nll",
-        "final_train_ppl",
+        "best_step",
+        "train_nll",
         "error",
     ]
 
