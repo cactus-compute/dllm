@@ -34,7 +34,7 @@ GRID = {
 
 # Fixed parameters
 FIXED_PARAMS = {
-    "model_name_or_path": "prajjwal1/bert-medium",
+    "model_name_or_path": "answerdotai/ModernBERT-base",
     "dataset_args": "tatsu-lab/alpaca",
     "max_length": 512,
     "num_train_epochs": 2,
@@ -84,10 +84,13 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
         result = subprocess.run(
             cmd,
             timeout=600,  # 10 minute timeout
+            capture_output=True,
+            text=True,
         )
 
         if result.returncode != 0:
             print(f"FAILED: return code {result.returncode}")
+            print(f"STDERR:\n{result.stderr[-2000:] if result.stderr else 'None'}")
             return {"error": f"Return code {result.returncode}"}
 
     except subprocess.TimeoutExpired:
