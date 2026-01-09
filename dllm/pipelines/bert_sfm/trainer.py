@@ -126,6 +126,7 @@ class BertSFMTrainer(transformers.Trainer):
         embed_type: str = "spherical"  # "spherical" or "simplex"
         loss_type: str = "ce"  # "ce" (cross-entropy) or "mse" (velocity MSE)
         eval_integration_steps: int = 20  # Number of integration steps for evaluation
+        weight_decay: float = 0.01  # AdamW weight decay (L2 regularization)
         # Dataloader optimizations - defaults set based on CUDA availability
         dataloader_num_workers: int = 8 if torch.cuda.is_available() else 0
         dataloader_pin_memory: bool = torch.cuda.is_available()
