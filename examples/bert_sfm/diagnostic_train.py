@@ -85,10 +85,8 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
 
         loss_mask = labels != -100
 
-        if hasattr(model, "get_input_embeddings"):
-            embed_layer = model.get_input_embeddings()
-        else:
-            embed_layer = model.model.embed_tokens
+        # Use unwrapped model to get embedding layer
+        embed_layer = unwrapped_model.get_input_embeddings()
 
         # ============================================================
         # DIAGNOSTIC 1: Loss bucketed by time t (single-step, training-style)
