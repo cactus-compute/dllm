@@ -64,6 +64,8 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     save_only_model: bool = False
     # More frequent eval for diagnostics
     eval_steps: float = 0.05  # Every 5%
+    # Use simple dt scaling instead of alpha_t_prime * dt / (1 - alpha_t)
+    use_simple_dt: bool = False
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
@@ -161,15 +163,21 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             t_next = timesteps[step_idx + 1]
             dt = t_next - t_curr
 
-            # Get schedule
-            if self.schedule_type == "linear":
-                alpha_t = t_curr
-                alpha_t_prime = torch.ones_like(t_curr)
+            # Get step weight
+            if self.args.use_simple_dt:
+                # Simple dt scaling like fisher-flow's tangent_euler
+                step_weight = dt
             else:
-                # Cosine schedule
-                import math
-                alpha_t = 1 - torch.cos(math.pi / 2 * t_curr).square()
-                alpha_t_prime = math.pi / 2 * torch.sin(math.pi * t_curr)
+                # Endpoint prediction formula: alpha_t_prime * dt / (1 - alpha_t)
+                if self.schedule_type == "linear":
+                    alpha_t = t_curr
+                    alpha_t_prime = torch.ones_like(t_curr)
+                else:
+                    # Cosine schedule
+                    import math
+                    alpha_t = 1 - torch.cos(math.pi / 2 * t_curr).square()
+                    alpha_t_prime = math.pi / 2 * torch.sin(math.pi * t_curr)
+                step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5))
 
             # Compute soft embeddings
             x_embed = x_sphere if self.embed_type == "spherical" else sphere_to_simplex(x_sphere)
@@ -203,7 +211,6 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
 
                 # Take integration step
                 x_1_pred = probs.sqrt()
-                step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5))
 
                 # Log map and exp map for geodesic step
                 dot_pq = (x_sphere * x_1_pred).sum(dim=-1, keepdim=True)
@@ -265,7 +272,9 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
 
             # Also print summary
             if self._diagnostic_step % 5 == 0:
+                scaling_mode = "simple dt" if self.args.use_simple_dt else "endpoint (alpha_t_prime*dt/(1-alpha_t))"
                 print(f"\n=== Diagnostic Summary (eval step {self._diagnostic_step}) ===")
+                print(f"Integration scaling: {scaling_mode}")
                 print(f"Loss by time bucket (training-style):")
                 for i in range(10):
                     print(f"  t={i*10}-{(i+1)*10}%: {bucket_losses[i]:.4f}")
