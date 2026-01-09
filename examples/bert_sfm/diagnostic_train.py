@@ -20,7 +20,6 @@ import accelerate
 import torch
 import torch.nn.functional as F
 import transformers
-import wandb
 
 import dllm
 from dllm.pipelines.bert_sfm import BertSFMTrainer
@@ -263,35 +262,6 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         # Only log on main process
         if self.accelerator.is_main_process:
             self.log(all_logs)
-
-            # Log combined line plots with eval_step as line identifier
-            # This allows comparing curves across training iterations
-            if wandb.run is not None:
-                eval_iter = self._diagnostic_step
-
-                # Bucket losses - each eval iteration is a separate line
-                bucket_data = [[i * 10 + 5, bucket_losses[i], f"eval_{eval_iter}"] for i in range(10)]
-                bucket_table = wandb.Table(data=bucket_data, columns=["t_pct", "loss", "eval_iter"])
-                wandb.log({"eval_bucket_losses_combined": wandb.plot.line(
-                    bucket_table, "t_pct", "loss", stroke="eval_iter",
-                    title="Loss by Time Bucket (training-style)"
-                )})
-
-                # Step losses
-                step_data = [[i, step_losses[i], f"eval_{eval_iter}"] for i in range(steps)]
-                step_table = wandb.Table(data=step_data, columns=["step", "loss", "eval_iter"])
-                wandb.log({"eval_step_losses_combined": wandb.plot.line(
-                    step_table, "step", "loss", stroke="eval_iter",
-                    title="CE by Integration Step"
-                )})
-
-                # Geodesic distances
-                dist_data = [[i, step_distances[i], f"eval_{eval_iter}"] for i in range(steps)]
-                dist_table = wandb.Table(data=dist_data, columns=["step", "geodist", "eval_iter"])
-                wandb.log({"eval_step_geodist_combined": wandb.plot.line(
-                    dist_table, "step", "geodist", stroke="eval_iter",
-                    title="Geodesic Distance by Step"
-                )})
 
             # Also print summary
             if self._diagnostic_step % 5 == 0:
