@@ -38,7 +38,7 @@ logger = dllm.utils.get_default_logger(__name__)
 
 @dataclass
 class ModelArguments(dllm.utils.ModelArguments):
-    model_name_or_path: str = "prajjwal1/bert-medium"
+    model_name_or_path: str = "answerdotai/ModernBERT-base"
 
 
 @dataclass
@@ -310,7 +310,7 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         if prediction_loss_only:
             return (loss.detach(), None, None)
 
-        return (loss.detach(), final_logits.detach().contiguous(), labels.detach().contiguous())
+        return (loss.detach(), logits.detach().contiguous(), labels.detach().contiguous())
 
 
 def train():
