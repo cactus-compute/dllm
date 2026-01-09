@@ -20,6 +20,7 @@ import accelerate
 import torch
 import torch.nn.functional as F
 import transformers
+import wandb
 
 import dllm
 from dllm.pipelines.bert_sfm import BertSFMTrainer
@@ -249,13 +250,42 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
 
         loss = token_nll.sum() / loss_mask.sum().clamp_min(1)
 
-        # Log all diagnostics
-        all_logs = {**bucket_log, **step_log, **dist_log}
-        all_logs["diag/final_eval_loss"] = loss.item()
+        # Log all diagnostics with eval_ prefix so wandb groups them correctly
+        all_logs = {}
+        for k, v in bucket_log.items():
+            all_logs[f"eval_{k.replace('diag/', '')}"] = v
+        for k, v in step_log.items():
+            all_logs[f"eval_{k.replace('diag/', '')}"] = v
+        for k, v in dist_log.items():
+            all_logs[f"eval_{k.replace('diag/', '')}"] = v
+        all_logs["eval_final_loss"] = loss.item()
 
         # Only log on main process
         if self.accelerator.is_main_process:
             self.log(all_logs)
+
+            # Log combined line plots for easy comparison
+            if wandb.run is not None:
+                # Bucket losses (red -> violet gradient)
+                bucket_data = [[i * 10 + 5, bucket_losses[i]] for i in range(10)]
+                bucket_table = wandb.Table(data=bucket_data, columns=["t_pct", "loss"])
+                wandb.log({"eval_bucket_losses_combined": wandb.plot.line(
+                    bucket_table, "t_pct", "loss", title="Loss by Time Bucket (training-style)"
+                )})
+
+                # Step losses (red -> violet gradient)
+                step_data = [[i, step_losses[i]] for i in range(steps)]
+                step_table = wandb.Table(data=step_data, columns=["step", "loss"])
+                wandb.log({"eval_step_losses_combined": wandb.plot.line(
+                    step_table, "step", "loss", title="CE by Integration Step"
+                )})
+
+                # Geodesic distances
+                dist_data = [[i, step_distances[i]] for i in range(steps)]
+                dist_table = wandb.Table(data=dist_data, columns=["step", "geodist"])
+                wandb.log({"eval_step_geodist_combined": wandb.plot.line(
+                    dist_table, "step", "geodist", title="Geodesic Distance by Step"
+                )})
 
             # Also print summary
             if self._diagnostic_step % 5 == 0:
