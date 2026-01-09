@@ -283,16 +283,17 @@ class BertSFMTrainer(transformers.Trainer):
 
         # Convert sphere to log-probs directly: sphere_to_simplex squares, so log(x^2) = 2*log(x)
         # This avoids allocating a separate final_probs tensor
+        # x_sphere^2 = probs, so 2*log(x_sphere) = log(probs)
         x_sphere.clamp_(min=1e-5)
-        final_logits = x_sphere.log_().mul_(2)  # in-place: log then scale by 2
+        final_log_probs = x_sphere.log_().mul_(2)  # in-place: log then scale by 2
 
-        # Compute cross-entropy loss on response positions only
-        token_nll = F.cross_entropy(
-            final_logits.transpose(1, 2),  # [b, V, l]
+        # Use nll_loss since we already have log probs (not cross_entropy which applies log_softmax)
+        token_nll = F.nll_loss(
+            final_log_probs.transpose(1, 2),  # [b, V, l]
             input_ids,  # [b, l]
             reduction="none",  # [b, l]
         )
-        del final_logits  # Free memory before metric update
+        del final_log_probs  # Free memory before metric update
         token_nll = token_nll * loss_mask.float()
 
         # Update metrics

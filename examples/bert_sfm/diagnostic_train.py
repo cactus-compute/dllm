@@ -188,13 +188,14 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 logits = outputs.logits
 
                 # Compute loss at this step (how well does model predict target?)
-                probs = F.softmax(logits, dim=-1)
-                log_probs = torch.log(probs.clamp(min=1e-10))
                 step_ce = F.cross_entropy(
-                    log_probs.transpose(1, 2), input_ids, reduction="none"
+                    logits.transpose(1, 2), input_ids, reduction="none"
                 )
                 masked_step_loss = (step_ce * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_losses.append(masked_step_loss.item())
+
+                # Get probs for integration step
+                probs = F.softmax(logits, dim=-1)
 
                 # ============================================================
                 # DIAGNOSTIC 3: Compare x_sphere to ground-truth x_t at this timestep
@@ -235,10 +236,11 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
 
         # Final eval (standard)
         final_probs = sphere_to_simplex(x_sphere)
-        final_logits = torch.log(final_probs.clamp(min=1e-10))
+        final_log_probs = torch.log(final_probs.clamp(min=1e-10))
 
-        token_nll = F.cross_entropy(
-            final_logits.transpose(1, 2), input_ids, reduction="none"
+        # Use nll_loss since we already have log probs (not cross_entropy which applies log_softmax)
+        token_nll = F.nll_loss(
+            final_log_probs.transpose(1, 2), input_ids, reduction="none"
         )
         token_nll = token_nll * loss_mask.float()
 
@@ -264,27 +266,33 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         if self.accelerator.is_main_process:
             self.log(all_logs)
 
-            # Log combined line plots for easy comparison
+            # Log combined line plots with eval_step as line identifier
+            # This allows comparing curves across training iterations
             if wandb.run is not None:
-                # Bucket losses (red -> violet gradient)
-                bucket_data = [[i * 10 + 5, bucket_losses[i]] for i in range(10)]
-                bucket_table = wandb.Table(data=bucket_data, columns=["t_pct", "loss"])
+                eval_iter = self._diagnostic_step
+
+                # Bucket losses - each eval iteration is a separate line
+                bucket_data = [[i * 10 + 5, bucket_losses[i], f"eval_{eval_iter}"] for i in range(10)]
+                bucket_table = wandb.Table(data=bucket_data, columns=["t_pct", "loss", "eval_iter"])
                 wandb.log({"eval_bucket_losses_combined": wandb.plot.line(
-                    bucket_table, "t_pct", "loss", title="Loss by Time Bucket (training-style)"
+                    bucket_table, "t_pct", "loss", stroke="eval_iter",
+                    title="Loss by Time Bucket (training-style)"
                 )})
 
-                # Step losses (red -> violet gradient)
-                step_data = [[i, step_losses[i]] for i in range(steps)]
-                step_table = wandb.Table(data=step_data, columns=["step", "loss"])
+                # Step losses
+                step_data = [[i, step_losses[i], f"eval_{eval_iter}"] for i in range(steps)]
+                step_table = wandb.Table(data=step_data, columns=["step", "loss", "eval_iter"])
                 wandb.log({"eval_step_losses_combined": wandb.plot.line(
-                    step_table, "step", "loss", title="CE by Integration Step"
+                    step_table, "step", "loss", stroke="eval_iter",
+                    title="CE by Integration Step"
                 )})
 
                 # Geodesic distances
-                dist_data = [[i, step_distances[i]] for i in range(steps)]
-                dist_table = wandb.Table(data=dist_data, columns=["step", "geodist"])
+                dist_data = [[i, step_distances[i], f"eval_{eval_iter}"] for i in range(steps)]
+                dist_table = wandb.Table(data=dist_data, columns=["step", "geodist", "eval_iter"])
                 wandb.log({"eval_step_geodist_combined": wandb.plot.line(
-                    dist_table, "step", "geodist", title="Geodesic Distance by Step"
+                    dist_table, "step", "geodist", stroke="eval_iter",
+                    title="Geodesic Distance by Step"
                 )})
 
             # Also print summary
