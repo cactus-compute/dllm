@@ -124,9 +124,6 @@ class BertSFMSampler(BaseSampler):
         device = x_sphere.device
         timesteps = torch.linspace(0, 1, steps + 1, device=device)
 
-        # Pre-expand flow_mask once to avoid repeated expansion
-        flow_mask_expanded = flow_mask.unsqueeze(-1).expand_as(x_sphere)
-
         histories = []
         if return_histories:
             init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
@@ -146,14 +143,11 @@ class BertSFMSampler(BaseSampler):
             soft_embeddings = torch.matmul(
                 x_embed.to(embed_layer.weight.dtype), embed_layer.weight
             )
+            if x_embed is not x_sphere:
+                del x_embed  # Free simplex conversion if created
 
-            # Use discrete embeddings for context, soft embeddings for flow positions
-            # Reuse soft_embeddings tensor for combined_embeddings
-            soft_embeddings = torch.where(
-                flow_mask.unsqueeze(-1).expand_as(soft_embeddings),
-                soft_embeddings,
-                context_embeds,
-            )
+            # Use discrete embeddings for context, soft embeddings for flow positions (in-place)
+            soft_embeddings[~flow_mask] = context_embeds[~flow_mask]
 
             # Model forward pass
             outputs = self.model(
@@ -208,8 +202,8 @@ class BertSFMSampler(BaseSampler):
             # Project to sphere in-place
             x_sphere_new.div_(torch.norm(x_sphere_new, dim=-1, keepdim=True).clamp(min=1e-8))
 
-            # Only update flow positions; keep context positions fixed
-            x_sphere = torch.where(flow_mask_expanded, x_sphere_new, x_sphere)
+            # Only update flow positions; keep context positions fixed (in-place)
+            x_sphere[flow_mask] = x_sphere_new[flow_mask]
             del x_sphere_new
 
             if return_histories:

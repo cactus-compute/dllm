@@ -22,6 +22,7 @@ from dllm.utils.configs import TrainingArguments
 from dllm.core.trainers.utils import NLLMetric, PPLMetric, OnEvaluateMetricsCallback
 from dllm.pipelines.bert_sfm.sampler import BertSFMSampler, BertSFMSamplerConfig
 from dllm.pipelines.bert_sfm.geodesic_utils import (
+    exp_map,
     log_map,
     parallel_transport,
     make_tangent,
@@ -216,6 +217,9 @@ class BertSFMTrainer(transformers.Trainer):
         1. Start from pure noise (t=0) for response positions, clean one-hot for prompt
         2. Integrate over 20 timesteps using Euler integration on the manifold
         3. Compute PPL on the final generated distribution vs ground truth
+
+        Memory-optimized: avoids redundant [B, L, V] allocations by initializing
+        x_sphere directly and using in-place updates where possible.
         """
 
         input_ids = inputs["input_ids"]
@@ -229,6 +233,7 @@ class BertSFMTrainer(transformers.Trainer):
 
         # Positions where we compute loss (response positions, not prompt)
         loss_mask = labels != -100  # [b, l]
+        prompt_mask = ~loss_mask  # [b, l]
 
         # Get embedding layer
         if hasattr(model, "get_input_embeddings"):
@@ -236,19 +241,18 @@ class BertSFMTrainer(transformers.Trainer):
         else:
             embed_layer = model.model.embed_tokens
 
-        # Initialize sphere state
-        # Prompt positions: clean one-hot on sphere
-        # Response positions: uniform prior (noise)
-        prompt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
-        x_sphere = simplex_to_sphere(prompt_onehot)
+        # Initialize sphere state: start with uniform prior for ALL positions
+        # This avoids creating separate prompt_onehot and prior_sample tensors
+        x_sphere = uniform_prior((b, l, vocab_size), device=device)
 
-        # Replace response positions with uniform prior
-        prior_sample = uniform_prior((b, l, vocab_size), device=device)
-        x_sphere = torch.where(
-            loss_mask.unsqueeze(-1).expand_as(x_sphere),
-            prior_sample,
-            x_sphere,
-        )
+        # For prompt positions, overwrite with one-hot on sphere (in-place)
+        # One-hot on sphere: all zeros except 1.0 at the token index
+        if prompt_mask.any():
+            x_sphere[prompt_mask] = 0
+            prompt_indices = input_ids[prompt_mask].unsqueeze(-1)
+            x_sphere[prompt_mask] = x_sphere[prompt_mask].scatter(-1, prompt_indices, 1.0)
+            del prompt_indices
+        del prompt_mask
 
         # Get discrete embeddings for context positions
         context_embeds = embed_layer(input_ids)
@@ -275,10 +279,12 @@ class BertSFMTrainer(transformers.Trainer):
             inference_scaling=1.0,
             return_histories=False,
         )
+        del context_embeds
 
-        # Convert final sphere state to probabilities for PPL
-        final_probs = sphere_to_simplex(x_sphere)  # [b, l, V]
-        final_logits = torch.log(final_probs.clamp(min=1e-10))
+        # Convert sphere to log-probs directly: sphere_to_simplex squares, so log(x^2) = 2*log(x)
+        # This avoids allocating a separate final_probs tensor
+        x_sphere.clamp_(min=1e-5)
+        final_logits = x_sphere.log_().mul_(2)  # in-place: log then scale by 2
 
         # Compute cross-entropy loss on response positions only
         token_nll = F.cross_entropy(
@@ -286,6 +292,7 @@ class BertSFMTrainer(transformers.Trainer):
             input_ids,  # [b, l]
             reduction="none",  # [b, l]
         )
+        del final_logits  # Free memory before metric update
         token_nll = token_nll * loss_mask.float()
 
         # Update metrics
@@ -296,12 +303,13 @@ class BertSFMTrainer(transformers.Trainer):
         )
 
         # Normalize loss
-        loss = token_nll.sum() / loss_mask.sum().clamp_min(1)
+        num_tokens = loss_mask.sum().clamp_min(1)
+        del loss_mask
+        loss = token_nll.sum() / num_tokens
+        del token_nll
 
-        if prediction_loss_only:
-            return (loss.detach(), None, None)
-
-        return (loss.detach(), final_logits.detach().contiguous(), labels.detach().contiguous())
+        # Always return prediction_loss_only=True style to avoid keeping final_logits
+        return (loss.detach(), None, None)
 
     def compute_loss(
         self,

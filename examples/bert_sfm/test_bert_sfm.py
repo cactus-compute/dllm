@@ -72,6 +72,14 @@ trainer_ce = BertSFMTrainer(
 result_ce = trainer_ce.train()
 print(f"Final CE loss: {result_ce.training_loss:.4f}")
 
+# Test evaluation (prediction_step)
+print("\n=== Testing Evaluation (prediction_step) ===")
+eval_dataset = dataset.select(range(5))  # Use 5 samples for eval
+trainer_ce.eval_dataset = eval_dataset
+eval_metrics = trainer_ce.evaluate()
+print(f"Eval metrics: {eval_metrics}")
+print("prediction_step test PASSED!")
+
 # Train with MSE loss (velocity prediction)
 print("\n=== Training with MSE Loss (velocity prediction) ===")
 model_mse = transformers.AutoModelForMaskedLM.from_pretrained(model_name)
