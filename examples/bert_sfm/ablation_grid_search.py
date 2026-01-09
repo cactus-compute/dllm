@@ -81,15 +81,11 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
     try:
         result = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
             timeout=600,  # 10 minute timeout
         )
 
         if result.returncode != 0:
             print(f"FAILED: return code {result.returncode}")
-            if result.stderr:
-                print(f"STDERR (last 500 chars): {result.stderr[-500:]}")
             return {"error": f"Return code {result.returncode}"}
 
     except subprocess.TimeoutExpired:
