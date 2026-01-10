@@ -180,4 +180,76 @@ with torch.no_grad():
 soft_preds = soft_outputs.logits[0].argmax(dim=-1)
 print(f"Soft embedding prediction: {tokenizer.decode(soft_preds)}")
 
+# Test self-consistency training
+print("\n=== Testing Self-Consistency Training ===")
+model_sc = transformers.AutoModelForMaskedLM.from_pretrained(model_name)
+
+args_sc = BertSFMTrainer.BertSFMConfig(
+    output_dir="/tmp/test_bert_sfm_self_consistency",
+    per_device_train_batch_size=20,
+    num_train_epochs=5,
+    learning_rate=5e-3,
+    logging_steps=5,
+    save_strategy="no",
+    report_to="none",
+    eval_strategy="no",
+    use_cpu=True,
+    dataloader_num_workers=0,
+    loss_type="ce",
+    # Self-consistency settings
+    self_consistency_prob=0.5,  # 50% of batches use self-consistency
+    self_consistency_max_steps=3,
+    self_consistency_schedule="constant",
+)
+
+trainer_sc = BertSFMTrainer(
+    model=model_sc,
+    args=args_sc,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    data_collator=transformers.DataCollatorForSeq2Seq(
+        tokenizer, return_tensors="pt", padding=True
+    ),
+)
+
+result_sc = trainer_sc.train()
+print(f"Final self-consistency loss: {result_sc.training_loss:.4f}")
+print("Self-consistency training test PASSED!")
+
+# Test linear_ramp schedule
+print("\n=== Testing Self-Consistency with Linear Ramp Schedule ===")
+model_sc_ramp = transformers.AutoModelForMaskedLM.from_pretrained(model_name)
+
+args_sc_ramp = BertSFMTrainer.BertSFMConfig(
+    output_dir="/tmp/test_bert_sfm_self_consistency_ramp",
+    per_device_train_batch_size=20,
+    num_train_epochs=5,
+    learning_rate=5e-3,
+    logging_steps=5,
+    save_strategy="no",
+    report_to="none",
+    eval_strategy="no",
+    use_cpu=True,
+    dataloader_num_workers=0,
+    loss_type="ce",
+    # Self-consistency with linear ramp
+    self_consistency_prob=0.5,
+    self_consistency_max_steps=3,
+    self_consistency_schedule="linear_ramp",
+)
+
+trainer_sc_ramp = BertSFMTrainer(
+    model=model_sc_ramp,
+    args=args_sc_ramp,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    data_collator=transformers.DataCollatorForSeq2Seq(
+        tokenizer, return_tensors="pt", padding=True
+    ),
+)
+
+result_sc_ramp = trainer_sc_ramp.train()
+print(f"Final linear_ramp self-consistency loss: {result_sc_ramp.training_loss:.4f}")
+print("Linear ramp self-consistency test PASSED!")
+
 print("\n=== Test Complete ===")

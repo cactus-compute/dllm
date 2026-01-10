@@ -9,6 +9,7 @@ References:
 - Fisher-Rao geometry for categorical distributions
 """
 
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -131,6 +132,10 @@ class BertSFMTrainer(transformers.Trainer):
         dataloader_num_workers: int = 8 if torch.cuda.is_available() else 0
         dataloader_pin_memory: bool = torch.cuda.is_available()
         dataloader_prefetch_factor: int | None = 2 if torch.cuda.is_available() else None
+        # Self-consistency training (exposes model to off-geodesic states during training)
+        self_consistency_prob: float = 0.0  # 0.0 = disabled, 0.5 = 50% of batches
+        self_consistency_max_steps: int = 5  # Maximum simulation steps
+        self_consistency_schedule: str = "constant"  # "constant" or "linear_ramp"
 
     def __init__(
         self,
@@ -159,6 +164,10 @@ class BertSFMTrainer(transformers.Trainer):
         self.embed_type = args.embed_type
         self.loss_type = args.loss_type
         self.eval_integration_steps = args.eval_integration_steps
+        # Self-consistency training
+        self.self_consistency_prob = args.self_consistency_prob
+        self.self_consistency_max_steps = args.self_consistency_max_steps
+        self.self_consistency_schedule = args.self_consistency_schedule
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -182,7 +191,7 @@ class BertSFMTrainer(transformers.Trainer):
         self,
         t: torch.Tensor,
         alpha_t: torch.Tensor,
-        inputs: dict[str, Any],
+        input_ids: torch.Tensor,
     ) -> torch.Tensor:
         """
         Compute loss weights given timestep t.
@@ -190,15 +199,15 @@ class BertSFMTrainer(transformers.Trainer):
         Args:
             t: Timestep values, shape (B,)
             alpha_t: Interpolation values, shape (B,)
-            inputs: Input dictionary with input_ids
+            input_ids: Input token IDs, shape (B, L)
 
         Returns:
             Loss weights, shape (B, L)
         """
-        b, l = inputs["input_ids"].shape
+        b, l = input_ids.shape
 
         if self.loss_weight_type == "uniform":
-            return torch.ones((b, l), device=inputs["input_ids"].device)
+            return torch.ones((b, l), device=input_ids.device)
         elif self.loss_weight_type == "time_weighted":
             # Weight by alpha_t / (1 - alpha_t) - emphasizes samples near t=1
             weights = alpha_t / (1 - alpha_t + 1e-5)
@@ -210,6 +219,95 @@ class BertSFMTrainer(transformers.Trainer):
             return loss_weights
         else:
             raise ValueError(f"Unknown loss_weight_type: {self.loss_weight_type}")
+
+    @torch.no_grad()
+    def _simulate_integration(
+        self,
+        x_0: torch.Tensor,
+        input_ids: torch.Tensor,
+        t: torch.Tensor,
+        model: nn.Module,
+        embed_layer: nn.Module,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Simulate integration steps to get off-geodesic states for self-consistency training.
+
+        Instead of using the exact geodesic interpolant x_t, this simulates the actual
+        inference process: starting from x_0, taking k integration steps using the model
+        itself to get an off-geodesic state that the model will encounter during inference.
+
+        Args:
+            x_0: Starting point on sphere (noise from prior), shape (B, L, V)
+            input_ids: Ground truth token indices, shape (B, L)
+            t: Target time to simulate to, shape (B,)
+            model: The language model
+            embed_layer: Embedding layer for soft embeddings
+            loss_mask: Boolean mask for flow positions (True = flow, False = prompt)
+
+        Returns:
+            x_t: Simulated state on sphere (off-geodesic), shape (B, L, V)
+        """
+        import random
+
+        b, l, v = x_0.shape
+        device = x_0.device
+        compute_dtype = embed_layer.weight.dtype
+
+        # Number of simulation steps (random between 1 and max_steps)
+        num_steps = random.randint(1, self.self_consistency_max_steps)
+
+        # We simulate from t=0 to the sampled time t
+        # dt for each step
+        t_mean = t.mean().item()  # Use mean t for step sizing
+        dt = t_mean / num_steps
+
+        # Start from x_0
+        x_current = x_0.clone()
+
+        # Prepare prompt one-hot on sphere for masking
+        prompt_onehot = F.one_hot(input_ids, num_classes=v).to(compute_dtype)
+        prompt_sphere = simplex_to_sphere(prompt_onehot)
+        flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_current)
+
+        # Keep prompt positions as clean one-hot
+        x_current = torch.where(flow_mask_expanded, x_current, prompt_sphere)
+
+        for step in range(num_steps):
+            t_curr = step * dt
+            t_next = (step + 1) * dt
+
+            # Get schedule values for step weight
+            alpha_t, alpha_t_prime = self._get_schedule(
+                torch.tensor([t_curr], device=device)
+            )
+
+            # Compute soft embeddings from current sphere state
+            x_embed = x_current if self.embed_type == "spherical" else sphere_to_simplex(x_current)
+            soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
+
+            # Forward pass
+            outputs = model(inputs_embeds=soft_embeddings)
+            logits = outputs.logits  # (B, L, V)
+
+            # Convert logits to sphere prediction (endpoint prediction)
+            probs = F.softmax(logits, dim=-1)
+            x_1_pred = probs.sqrt()  # sphere representation
+
+            # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
+            step_weight = alpha_t_prime * dt / (1 - alpha_t + 1e-5)
+
+            # Take geodesic step toward predicted endpoint
+            tangent = log_map(x_current, x_1_pred) * step_weight
+            x_new = exp_map(x_current, tangent)
+
+            # Project to sphere for numerical stability
+            x_new = x_new / torch.norm(x_new, dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # Only update flow positions; keep prompt positions fixed
+            x_current = torch.where(flow_mask_expanded, x_new, prompt_sphere)
+
+        return x_current
 
     @torch.no_grad()
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
@@ -374,26 +472,81 @@ class BertSFMTrainer(transformers.Trainer):
         # === 2. Sample noise from uniform prior on sphere ===
         x_0 = uniform_prior((b, l, vocab_size), device=device, dtype=compute_dtype)  # [b, l, V]
 
-        # === 3. Geodesic interpolation (optimized for one-hot targets) ===
-        # Since x_1 is always one-hot (sqrt of one-hot = one-hot on sphere),
-        # we use an optimized path that avoids materializing the full x_1 tensor
-        x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
+        # === 3. Compute x_t: either via geodesic interpolation or self-consistency simulation ===
+        # Determine if we should use self-consistency for this batch
+        if self.self_consistency_schedule == "linear_ramp":
+            # Ramp up self-consistency probability over training
+            training_progress = self.state.global_step / max(self.state.max_steps, 1)
+            effective_sc_prob = min(self.self_consistency_prob, training_progress * self.self_consistency_prob * 2)
+        else:
+            effective_sc_prob = self.self_consistency_prob
 
-        # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
-        if self.loss_type == "ce":
-            del x_0
+        use_self_consistency = (
+            effective_sc_prob > 0
+            and random.random() < effective_sc_prob
+            and model.training
+        )
 
-        # === 3b. Keep prompt positions clean (not noised) ===
-        # For positions where loss_mask=False (prompt), use the clean one-hot on sphere
-        # This teaches the model to condition on clean prompts while denoising targets
-        # Use in-place operations to avoid allocating another [b, l, V] tensor
-        if not loss_mask.all():
-            # Zero out prompt positions and scatter 1.0 at the correct token indices
-            prompt_mask = ~loss_mask  # positions to make clean
-            x_t[prompt_mask] = 0  # zero out prompt positions
-            # Scatter 1.0 at the target token index for prompt positions
-            prompt_indices = input_ids[prompt_mask].unsqueeze(-1)  # [num_prompt_tokens, 1]
-            x_t[prompt_mask] = x_t[prompt_mask].scatter(-1, prompt_indices, 1.0)
+        # Track original batch size for loss scaling
+        original_batch_size = b
+        sc_loss_scale = 1.0
+
+        if use_self_consistency:
+            # Self-consistency: simulate integration to get off-geodesic state
+            # This exposes the model to states it will encounter during inference
+            #
+            # Reduce batch size to 1/max_steps since simulation requires multiple forward passes
+            # This keeps the compute cost roughly equivalent to standard training
+            sc_batch_size = max(1, b // self.self_consistency_max_steps)
+            sc_indices = torch.randperm(b, device=device)[:sc_batch_size]
+
+            # Scale loss up to compensate for reduced batch size
+            # This ensures gradient magnitude is consistent with full-batch training
+            sc_loss_scale = original_batch_size / sc_batch_size
+
+            # Slice tensors to reduced batch
+            x_0_sc = x_0[sc_indices]
+            input_ids_sc = input_ids[sc_indices]
+            alpha_t_sc = alpha_t[sc_indices]
+            loss_mask_sc = loss_mask[sc_indices]
+            if attention_mask is not None:
+                attention_mask = attention_mask[sc_indices]
+
+            x_t = self._simulate_integration(x_0_sc, input_ids_sc, alpha_t_sc, model, embed_layer, loss_mask_sc)
+
+            # Update variables to use reduced batch
+            input_ids = input_ids_sc
+            t = t[sc_indices]
+            alpha_t = alpha_t_sc
+            loss_mask = loss_mask_sc
+            b = sc_batch_size
+
+            # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
+            if self.loss_type == "ce":
+                del x_0, x_0_sc
+            else:
+                x_0 = x_0_sc
+        else:
+            # Standard: use exact geodesic interpolant
+            # Since x_1 is always one-hot (sqrt of one-hot = one-hot on sphere),
+            # we use an optimized path that avoids materializing the full x_1 tensor
+            x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
+
+            # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
+            if self.loss_type == "ce":
+                del x_0
+
+            # === 3b. Keep prompt positions clean (not noised) ===
+            # For positions where loss_mask=False (prompt), use the clean one-hot on sphere
+            # This teaches the model to condition on clean prompts while denoising targets
+            # Use in-place operations to avoid allocating another [b, l, V] tensor
+            if not loss_mask.all():
+                # Zero out prompt positions and scatter 1.0 at the correct token indices
+                prompt_mask = ~loss_mask  # positions to make clean
+                x_t[prompt_mask] = 0  # zero out prompt positions
+                # Scatter 1.0 at the target token index for prompt positions
+                prompt_indices = input_ids[prompt_mask].unsqueeze(-1)  # [num_prompt_tokens, 1]
+                x_t[prompt_mask] = x_t[prompt_mask].scatter(-1, prompt_indices, 1.0)
 
         # === 5. Forward pass ===
         # Compute soft embeddings: x_embed @ embedding_matrix
@@ -411,7 +564,7 @@ class BertSFMTrainer(transformers.Trainer):
         logits = outputs.logits  # [b, l, V]
 
         # === 6. Compute per-token loss weights ===
-        loss_weights = self._compute_loss_weights(t, alpha_t, inputs)  # [b, l]
+        loss_weights = self._compute_loss_weights(t, alpha_t, input_ids)  # [b, l]
 
         # === 7. Compute loss based on loss_type ===
         if self.loss_type == "ce":
@@ -462,6 +615,6 @@ class BertSFMTrainer(transformers.Trainer):
         else:
             raise ValueError(f"Invalid loss_norm_type: {self.loss_norm_type}")
 
-        loss = token_loss.sum()
+        loss = token_loss.sum() * sc_loss_scale
 
         return (loss, outputs) if return_outputs else loss

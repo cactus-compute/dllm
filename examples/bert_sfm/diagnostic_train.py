@@ -66,6 +66,11 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     eval_steps: float = 0.05  # Every 5%
     # Use simple dt scaling instead of alpha_t_prime * dt / (1 - alpha_t)
     use_simple_dt: bool = False
+    # Self-consistency training: exposes model to off-geodesic states during training
+    # This addresses distribution mismatch between training (on-geodesic) and inference (off-geodesic)
+    self_consistency_prob: float = 0.0  # 0.0 = disabled, try 0.3 for testing
+    self_consistency_max_steps: int = 5  # Maximum simulation steps
+    self_consistency_schedule: str = "constant"  # "constant" or "linear_ramp"
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
