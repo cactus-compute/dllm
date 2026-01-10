@@ -553,7 +553,8 @@ class BertSFMTrainer(transformers.Trainer):
         # x_t is on sphere; convert to simplex if embed_type == "simplex"
         x_embed = x_t if self.embed_type == "spherical" else sphere_to_simplex(x_t)
         # x_embed: [b, l, V], embed_weight: [V, D] -> [b, l, D]
-        soft_embeddings = torch.matmul(x_embed, embed_layer.weight)
+        # Ensure dtype matches embedding layer (important for mixed precision training)
+        soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
 
         # Forward pass with soft embeddings
         # Most HuggingFace models accept inputs_embeds
