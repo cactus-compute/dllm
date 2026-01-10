@@ -234,13 +234,18 @@ class BertSFMTrainer(transformers.Trainer):
         Simulate integration steps to get off-geodesic states for self-consistency training.
 
         Instead of using the exact geodesic interpolant x_t, this simulates the actual
-        inference process: starting from x_0, taking k integration steps using the model
+        inference process: starting from x_0, taking integration steps using the model
         itself to get an off-geodesic state that the model will encounter during inference.
+
+        Key insight: We simulate from t=0 toward t=1 using a fixed number of steps
+        (like inference), then return the state at the step closest to the target time t.
+        This ensures the model sees realistic off-geodesic states that accumulate error
+        over multiple integration steps.
 
         Args:
             x_0: Starting point on sphere (noise from prior), shape (B, L, V)
             input_ids: Ground truth token indices, shape (B, L)
-            t: Target time to simulate to, shape (B,)
+            t: Target time to return state at, shape (B,)
             model: The language model
             embed_layer: Embedding layer for soft embeddings
             loss_mask: Boolean mask for flow positions (True = flow, False = prompt)
@@ -248,19 +253,21 @@ class BertSFMTrainer(transformers.Trainer):
         Returns:
             x_t: Simulated state on sphere (off-geodesic), shape (B, L, V)
         """
-        import random
-
         b, l, v = x_0.shape
         device = x_0.device
         compute_dtype = embed_layer.weight.dtype
 
-        # Number of simulation steps (random between 1 and max_steps)
-        num_steps = random.randint(1, self.self_consistency_max_steps)
+        # Use fixed number of steps (like inference) to ensure consistent error accumulation
+        num_steps = self.self_consistency_max_steps
 
-        # We simulate from t=0 to the sampled time t
-        # dt for each step
-        t_mean = t.mean().item()  # Use mean t for step sizing
-        dt = t_mean / num_steps
+        # Time grid from 0 to 1 (full integration like inference)
+        timesteps = torch.linspace(0, 1, num_steps + 1, device=device)
+        dt = 1.0 / num_steps
+
+        # Find which step index corresponds to target time t (use mean for batch)
+        t_mean = t.mean().item()
+        target_step = min(int(t_mean * num_steps), num_steps - 1)
+        target_step = max(1, target_step)  # At least 1 step
 
         # Start from x_0
         x_current = x_0.clone()
@@ -273,14 +280,12 @@ class BertSFMTrainer(transformers.Trainer):
         # Keep prompt positions as clean one-hot
         x_current = torch.where(flow_mask_expanded, x_current, prompt_sphere)
 
-        for step in range(num_steps):
-            t_curr = step * dt
-            t_next = (step + 1) * dt
+        # Simulate integration steps until we reach the target step
+        for step in range(target_step):
+            t_curr = timesteps[step]
 
             # Get schedule values for step weight
-            alpha_t, alpha_t_prime = self._get_schedule(
-                torch.tensor([t_curr], device=device)
-            )
+            alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0))
 
             # Compute soft embeddings from current sphere state
             x_embed = x_current if self.embed_type == "spherical" else sphere_to_simplex(x_current)
