@@ -68,9 +68,19 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     use_simple_dt: bool = False
     # Self-consistency training: exposes model to off-geodesic states during training
     # This addresses distribution mismatch between training (on-geodesic) and inference (off-geodesic)
-    self_consistency_prob: float = 0.0  # 0.0 = disabled, try 0.3 for testing
-    self_consistency_max_steps: int = 5  # Maximum simulation steps
+    self_consistency_prob: float = 0.0  # 0.0 = disabled, try 0.5 for testing
+    self_consistency_max_steps: int = 5  # Maximum simulation steps (for "simulate" mode)
     self_consistency_schedule: str = "constant"  # "constant" or "linear_ramp"
+    # Self-consistency mode: "noise" (recommended) or "simulate"
+    # "noise" adds tangent space noise - cheap and effective
+    # "simulate" runs integration with model - expensive but more realistic
+    self_consistency_mode: str = "noise"
+    # Noise scale for "noise" mode (scaled by t, so more noise at later timesteps)
+    self_consistency_noise_scale: float = 0.1
+    # Step weight capping during evaluation to prevent blow-up near t=1
+    # The formula alpha'(t)*dt/(1-alpha(t)) explodes as t->1, causing instability
+    # 0 = no cap (default), e.g. 4.0 = cap step weight at 4x dt
+    eval_step_weight_cap: float = 0.0
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):

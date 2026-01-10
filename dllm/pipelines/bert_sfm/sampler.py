@@ -45,6 +45,9 @@ class BertSFMSamplerConfig(SamplerConfig):
     inference_scaling: float = 1.0  # Scaling factor for step sizes
     embed_type: str = "spherical"  # "spherical" or "simplex"
     prediction_type: str = "endpoint"  # "endpoint" (CE) or "velocity" (MSE)
+    # Step weight capping to prevent blow-up near t=1
+    # Set to 0 to disable capping, otherwise caps step_weight at this multiple of dt
+    step_weight_cap: float = 0.0  # 0 = no cap, e.g. 4.0 = cap at 4x dt
 
 
 # ============== Sampler ==============
@@ -176,6 +179,13 @@ class BertSFMSampler(BaseSampler):
 
                 # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
                 step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5)) * inference_scaling
+
+                # Optionally cap step weight to prevent blow-up near t=1
+                # This trades off some accuracy for stability when model predictions are imperfect
+                step_weight_cap = getattr(config, "step_weight_cap", 0.0)
+                if step_weight_cap > 0:
+                    max_weight = step_weight_cap * dt
+                    step_weight = min(step_weight, max_weight)
 
                 # Step along geodesic toward predicted endpoint
                 # log_map_inplace stores result in x_1_pred (now becomes tangent)

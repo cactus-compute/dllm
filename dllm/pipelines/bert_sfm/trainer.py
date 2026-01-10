@@ -134,8 +134,18 @@ class BertSFMTrainer(transformers.Trainer):
         dataloader_prefetch_factor: int | None = 2 if torch.cuda.is_available() else None
         # Self-consistency training (exposes model to off-geodesic states during training)
         self_consistency_prob: float = 0.0  # 0.0 = disabled, 0.5 = 50% of batches
-        self_consistency_max_steps: int = 5  # Maximum simulation steps
+        self_consistency_max_steps: int = 5  # Maximum simulation steps (for "simulate" mode)
         self_consistency_schedule: str = "constant"  # "constant" or "linear_ramp"
+        # Self-consistency mode: "simulate" (old) or "noise" (new, recommended)
+        # "noise" adds tangent space noise to x_t instead of simulating integration
+        # This is cheaper and works better early in training
+        self_consistency_mode: str = "noise"
+        # Noise scale for "noise" mode - controls perturbation magnitude
+        # The actual noise is scaled by t (more noise at later timesteps where errors accumulate)
+        self_consistency_noise_scale: float = 0.1
+        # Step weight capping during evaluation to prevent blow-up near t=1
+        # 0 = no cap, e.g. 4.0 = cap at 4x dt (helps when model predictions are imperfect)
+        eval_step_weight_cap: float = 0.0
 
     def __init__(
         self,
@@ -168,6 +178,10 @@ class BertSFMTrainer(transformers.Trainer):
         self.self_consistency_prob = args.self_consistency_prob
         self.self_consistency_max_steps = args.self_consistency_max_steps
         self.self_consistency_schedule = args.self_consistency_schedule
+        self.self_consistency_mode = args.self_consistency_mode
+        self.self_consistency_noise_scale = args.self_consistency_noise_scale
+        # Step weight capping for evaluation
+        self.eval_step_weight_cap = args.eval_step_weight_cap
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -314,6 +328,57 @@ class BertSFMTrainer(transformers.Trainer):
 
         return x_current
 
+    def _add_tangent_noise(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        loss_mask: torch.Tensor,
+        noise_scale: float,
+    ) -> torch.Tensor:
+        """
+        Add noise in the tangent space at x_t to simulate off-geodesic states.
+
+        This is a simpler and more effective alternative to full simulation.
+        The noise magnitude scales with t (more noise at later times where
+        integration errors accumulate more).
+
+        Args:
+            x_t: Current state on sphere, shape (B, L, V)
+            t: Current time values, shape (B,)
+            loss_mask: Boolean mask for flow positions (True = flow, False = prompt)
+            noise_scale: Base scale for the noise
+
+        Returns:
+            x_t_noisy: Perturbed state on sphere, shape (B, L, V)
+        """
+        b, l, v = x_t.shape
+        device = x_t.device
+        dtype = x_t.dtype
+
+        # Generate random noise in R^V
+        noise = torch.randn(b, l, v, device=device, dtype=dtype)
+
+        # Project noise to tangent space at x_t: noise - <x_t, noise> * x_t
+        dot = (x_t * noise).sum(dim=-1, keepdim=True)
+        tangent_noise = noise - dot * x_t
+
+        # Scale noise by t (more noise at later times) and base scale
+        # At t=0, no noise; at t=1, full noise_scale
+        t_expanded = t.view(b, 1, 1).expand(b, l, 1)
+        scaled_noise = tangent_noise * t_expanded * noise_scale
+
+        # Move along tangent direction using exp_map
+        x_t_noisy = exp_map(x_t, scaled_noise)
+
+        # Project back to sphere for numerical stability
+        x_t_noisy = x_t_noisy / torch.norm(x_t_noisy, dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Only perturb flow positions; keep prompt positions clean
+        flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_t)
+        x_t_noisy = torch.where(flow_mask_expanded, x_t_noisy, x_t)
+
+        return x_t_noisy
+
     @torch.no_grad()
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """
@@ -371,6 +436,7 @@ class BertSFMTrainer(transformers.Trainer):
             schedule_type=self.schedule_type,
             schedule_nu=self.schedule_nu,
             embed_type=self.embed_type,
+            step_weight_cap=self.eval_step_weight_cap,
         )
 
         # Run flow integration (reuses the core loop)
@@ -477,10 +543,27 @@ class BertSFMTrainer(transformers.Trainer):
         # === 2. Sample noise from uniform prior on sphere ===
         x_0 = uniform_prior((b, l, vocab_size), device=device, dtype=compute_dtype)  # [b, l, V]
 
-        # === 3. Compute x_t: either via geodesic interpolation or self-consistency simulation ===
+        # === 3. Compute x_t via geodesic interpolation ===
+        # Since x_1 is always one-hot (sqrt of one-hot = one-hot on sphere),
+        # we use an optimized path that avoids materializing the full x_1 tensor
+        x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
+
+        # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
+        if self.loss_type == "ce":
+            del x_0
+
+        # === 3b. Keep prompt positions clean (not noised) ===
+        # For positions where loss_mask=False (prompt), use the clean one-hot on sphere
+        # This teaches the model to condition on clean prompts while denoising targets
+        if not loss_mask.all():
+            prompt_mask = ~loss_mask
+            x_t[prompt_mask] = 0
+            prompt_indices = input_ids[prompt_mask].unsqueeze(-1)
+            x_t[prompt_mask] = x_t[prompt_mask].scatter(-1, prompt_indices, 1.0)
+
+        # === 3c. Self-consistency: add perturbation to expose model to off-geodesic states ===
         # Determine if we should use self-consistency for this batch
         if self.self_consistency_schedule == "linear_ramp":
-            # Ramp up self-consistency probability over training
             training_progress = self.state.global_step / max(self.state.max_steps, 1)
             effective_sc_prob = min(self.self_consistency_prob, training_progress * self.self_consistency_prob * 2)
         else:
@@ -492,66 +575,19 @@ class BertSFMTrainer(transformers.Trainer):
             and model.training
         )
 
-        # Track original batch size for loss scaling
-        original_batch_size = b
-        sc_loss_scale = 1.0
-
         if use_self_consistency:
-            # Self-consistency: simulate integration to get off-geodesic state
-            # This exposes the model to states it will encounter during inference
-            #
-            # Reduce batch size to 1/max_steps since simulation requires multiple forward passes
-            # This keeps the compute cost roughly equivalent to standard training
-            sc_batch_size = max(1, b // self.self_consistency_max_steps)
-            sc_indices = torch.randperm(b, device=device)[:sc_batch_size]
-
-            # Scale loss up to compensate for reduced batch size
-            # This ensures gradient magnitude is consistent with full-batch training
-            sc_loss_scale = original_batch_size / sc_batch_size
-
-            # Slice tensors to reduced batch
-            x_0_sc = x_0[sc_indices]
-            input_ids_sc = input_ids[sc_indices]
-            alpha_t_sc = alpha_t[sc_indices]
-            loss_mask_sc = loss_mask[sc_indices]
-            if attention_mask is not None:
-                attention_mask = attention_mask[sc_indices]
-
-            x_t = self._simulate_integration(x_0_sc, input_ids_sc, alpha_t_sc, model, embed_layer, loss_mask_sc)
-
-            # Update variables to use reduced batch
-            input_ids = input_ids_sc
-            t = t[sc_indices]
-            alpha_t = alpha_t_sc
-            loss_mask = loss_mask_sc
-            b = sc_batch_size
-
-            # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
-            if self.loss_type == "ce":
-                del x_0, x_0_sc
+            if self.self_consistency_mode == "noise":
+                # Noise mode: add tangent space noise to x_t
+                # This is cheap (no extra forward passes) and works from the start of training
+                x_t = self._add_tangent_noise(x_t, t, loss_mask, self.self_consistency_noise_scale)
+            elif self.self_consistency_mode == "simulate":
+                # Simulate mode: run integration with the model to get off-geodesic states
+                # This is more expensive but may be more realistic
+                # Note: we need x_0 for simulation, so re-sample it
+                x_0_sim = uniform_prior((b, l, vocab_size), device=device, dtype=compute_dtype)
+                x_t = self._simulate_integration(x_0_sim, input_ids, alpha_t, model, embed_layer, loss_mask)
             else:
-                x_0 = x_0_sc
-        else:
-            # Standard: use exact geodesic interpolant
-            # Since x_1 is always one-hot (sqrt of one-hot = one-hot on sphere),
-            # we use an optimized path that avoids materializing the full x_1 tensor
-            x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
-
-            # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
-            if self.loss_type == "ce":
-                del x_0
-
-            # === 3b. Keep prompt positions clean (not noised) ===
-            # For positions where loss_mask=False (prompt), use the clean one-hot on sphere
-            # This teaches the model to condition on clean prompts while denoising targets
-            # Use in-place operations to avoid allocating another [b, l, V] tensor
-            if not loss_mask.all():
-                # Zero out prompt positions and scatter 1.0 at the correct token indices
-                prompt_mask = ~loss_mask  # positions to make clean
-                x_t[prompt_mask] = 0  # zero out prompt positions
-                # Scatter 1.0 at the target token index for prompt positions
-                prompt_indices = input_ids[prompt_mask].unsqueeze(-1)  # [num_prompt_tokens, 1]
-                x_t[prompt_mask] = x_t[prompt_mask].scatter(-1, prompt_indices, 1.0)
+                raise ValueError(f"Unknown self_consistency_mode: {self.self_consistency_mode}")
 
         # === 5. Forward pass ===
         # Compute soft embeddings: x_embed @ embedding_matrix
@@ -621,6 +657,6 @@ class BertSFMTrainer(transformers.Trainer):
         else:
             raise ValueError(f"Invalid loss_norm_type: {self.loss_norm_type}")
 
-        loss = token_loss.sum() * sc_loss_scale
+        loss = token_loss.sum()
 
         return (loss, outputs) if return_outputs else loss

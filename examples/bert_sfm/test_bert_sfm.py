@@ -180,8 +180,8 @@ with torch.no_grad():
 soft_preds = soft_outputs.logits[0].argmax(dim=-1)
 print(f"Soft embedding prediction: {tokenizer.decode(soft_preds)}")
 
-# Test self-consistency training
-print("\n=== Testing Self-Consistency Training ===")
+# Test self-consistency training (noise mode - recommended)
+print("\n=== Testing Self-Consistency Training (Noise Mode) ===")
 model_sc = transformers.AutoModelForMaskedLM.from_pretrained(model_name)
 
 args_sc = BertSFMTrainer.BertSFMConfig(
@@ -196,9 +196,10 @@ args_sc = BertSFMTrainer.BertSFMConfig(
     use_cpu=True,
     dataloader_num_workers=0,
     loss_type="ce",
-    # Self-consistency settings
+    # Self-consistency settings (noise mode)
     self_consistency_prob=0.5,  # 50% of batches use self-consistency
-    self_consistency_max_steps=3,
+    self_consistency_mode="noise",  # Tangent space noise injection
+    self_consistency_noise_scale=0.1,
     self_consistency_schedule="constant",
 )
 
@@ -216,7 +217,7 @@ result_sc = trainer_sc.train()
 print(f"Final self-consistency loss: {result_sc.training_loss:.4f}")
 print("Self-consistency training test PASSED!")
 
-# Test linear_ramp schedule
+# Test linear_ramp schedule with noise mode
 print("\n=== Testing Self-Consistency with Linear Ramp Schedule ===")
 model_sc_ramp = transformers.AutoModelForMaskedLM.from_pretrained(model_name)
 
@@ -232,9 +233,10 @@ args_sc_ramp = BertSFMTrainer.BertSFMConfig(
     use_cpu=True,
     dataloader_num_workers=0,
     loss_type="ce",
-    # Self-consistency with linear ramp
+    # Self-consistency with linear ramp (noise mode)
     self_consistency_prob=0.5,
-    self_consistency_max_steps=3,
+    self_consistency_mode="noise",
+    self_consistency_noise_scale=0.1,
     self_consistency_schedule="linear_ramp",
 )
 
