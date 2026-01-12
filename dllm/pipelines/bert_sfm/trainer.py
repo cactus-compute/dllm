@@ -146,6 +146,10 @@ class BertSFMTrainer(transformers.Trainer):
         # Step weight capping during evaluation to prevent blow-up near t=1
         # 0 = no cap, e.g. 4.0 = cap at 4x dt (helps when model predictions are imperfect)
         eval_step_weight_cap: float = 0.0
+        # Geodesic loss: auxiliary loss that penalizes when sqrt(softmax(logits)) is far from
+        # the true endpoint on the sphere. This aligns training with inference behavior.
+        # 0 = disabled, try 0.1-1.0 for moderate regularization
+        geodesic_loss_weight: float = 0.0
 
     def __init__(
         self,
@@ -182,6 +186,8 @@ class BertSFMTrainer(transformers.Trainer):
         self.self_consistency_noise_scale = args.self_consistency_noise_scale
         # Step weight capping for evaluation
         self.eval_step_weight_cap = args.eval_step_weight_cap
+        # Geodesic loss
+        self.geodesic_loss_weight = args.geodesic_loss_weight
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -616,6 +622,35 @@ class BertSFMTrainer(transformers.Trainer):
                 input_ids,  # [b, l]
                 reduction="none",  # [b, l]
             )
+
+            # === 7b. Optional: Geodesic loss to align training with inference ===
+            # During inference, we use sqrt(softmax(logits)) as the predicted endpoint.
+            # CE loss only ensures the correct token has high probability, not that
+            # sqrt(softmax) lies on the geodesic toward the correct endpoint.
+            # This auxiliary loss directly penalizes geodesic distance.
+            if self.geodesic_loss_weight > 0:
+                # Predicted endpoint on sphere: sqrt(softmax(logits))
+                probs = F.softmax(logits, dim=-1)  # [b, l, V]
+                x_pred = probs.sqrt()  # [b, l, V] - predicted endpoint on sphere
+
+                # True endpoint on sphere: one-hot (which equals its sqrt)
+                # x_true[i, j, k] = 1 if k == input_ids[i, j] else 0
+                # Compute geodesic distance: arccos(<x_pred, x_true>)
+                # <x_pred, x_true> = x_pred[..., input_ids] = the predicted sqrt-prob at true token
+                x_pred_at_target = x_pred.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)  # [b, l]
+
+                # Geodesic distance = arccos(dot product), but dot product = x_pred_at_target
+                # since x_true is one-hot (all zeros except 1 at target position)
+                geodesic_dist = torch.acos(x_pred_at_target.clamp(-1 + 1e-6, 1 - 1e-6))  # [b, l]
+
+                # Weight by (1-t) to emphasize errors near t=1 where integration is more critical
+                # At t close to 1, we're near the endpoint and errors matter most
+                t_weight = (1 - alpha_t).view(b, 1).expand(b, l)
+                geodesic_loss_per_token = geodesic_dist * t_weight  # [b, l]
+
+                # Add to token_loss with weighting
+                token_loss = token_loss + self.geodesic_loss_weight * geodesic_loss_per_token
+
         elif self.loss_type == "mse":
             # Velocity MSE loss: target is the velocity (tangent vector)
             # Construct x_1 (one-hot on sphere) for target positions

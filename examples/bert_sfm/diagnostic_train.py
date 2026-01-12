@@ -29,6 +29,8 @@ from dllm.pipelines.bert_sfm.geodesic_utils import (
     simplex_to_sphere,
     uniform_prior,
     geodesic_interpolant,
+    exp_map,
+    make_tangent,
 )
 from dllm.pipelines.bert_sfm.trainer import geodesic_interpolant_to_onehot
 
@@ -81,6 +83,9 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     # The formula alpha'(t)*dt/(1-alpha(t)) explodes as t->1, causing instability
     # 0 = no cap (default), e.g. 4.0 = cap step weight at 4x dt
     eval_step_weight_cap: float = 0.0
+    # Geodesic loss: auxiliary loss to align CE training with inference
+    # 0 = disabled, try 0.1-1.0 for moderate regularization
+    geodesic_loss_weight: float = 0.0
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
@@ -214,9 +219,6 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 masked_step_loss = (step_ce * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_losses.append(masked_step_loss.item())
 
-                # Get probs for integration step
-                probs = F.softmax(logits, dim=-1)
-
                 # ============================================================
                 # DIAGNOSTIC 3: Compare x_sphere to ground-truth x_t at this timestep
                 # ============================================================
@@ -224,17 +226,26 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 x_0_gt = prior_sample  # Same noise we started with
                 x_t_gt = geodesic_interpolant_to_onehot(x_0_gt, input_ids, t_next.unsqueeze(0).expand(b))
 
-                # Take integration step
-                x_1_pred = probs.sqrt()
+                # Take integration step - different for CE vs MSE
+                if self.loss_type == "mse":
+                    # MSE/Velocity prediction: logits are velocity, project to tangent space
+                    velocity = make_tangent(x_sphere, logits)
+                    # For velocity prediction, use simple dt scaling
+                    tangent = velocity * dt
+                else:
+                    # CE/Endpoint prediction: logits -> probs -> sqrt -> sphere point
+                    probs = F.softmax(logits, dim=-1)
+                    x_1_pred = probs.sqrt()
 
-                # Log map and exp map for geodesic step
-                dot_pq = (x_sphere * x_1_pred).sum(dim=-1, keepdim=True)
-                q_proj = x_1_pred - dot_pq * x_sphere
-                q_proj_norm = torch.norm(q_proj, dim=-1, keepdim=True).clamp(min=1e-8)
-                dot_clamped = dot_pq.clamp(-1 + 1e-7, 1 - 1e-7)
-                dist = torch.acos(dot_clamped)
-                tangent = q_proj / q_proj_norm * dist * step_weight
+                    # Log map and exp map for geodesic step
+                    dot_pq = (x_sphere * x_1_pred).sum(dim=-1, keepdim=True)
+                    q_proj = x_1_pred - dot_pq * x_sphere
+                    q_proj_norm = torch.norm(q_proj, dim=-1, keepdim=True).clamp(min=1e-8)
+                    dot_clamped = dot_pq.clamp(-1 + 1e-7, 1 - 1e-7)
+                    dist = torch.acos(dot_clamped)
+                    tangent = q_proj / q_proj_norm * dist * step_weight
 
+                # Apply exp_map to get new position
                 v_norm = torch.norm(tangent, dim=-1, keepdim=True).clamp(min=1e-8)
                 x_sphere_new = x_sphere * torch.cos(v_norm) + tangent * torch.sin(v_norm) / v_norm
                 x_sphere_new = x_sphere_new / torch.norm(x_sphere_new, dim=-1, keepdim=True).clamp(min=1e-8)
