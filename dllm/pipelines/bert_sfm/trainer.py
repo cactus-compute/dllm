@@ -674,6 +674,11 @@ class BertSFMTrainer(transformers.Trainer):
                     x_0, x_t, input_ids, predicted_velocity
                 )  # [b, l]
 
+                # Normalize MSE to be on similar scale as CE loss
+                # MSE sums over vocab_size dimensions, so divide by vocab_size
+                # This makes mse_loss_weight=1.0 roughly equal weighting with CE
+                mse_loss_per_token = mse_loss_per_token / vocab_size
+
                 # Add to token_loss with weighting
                 token_loss = token_loss + self.mse_loss_weight * mse_loss_per_token
 
