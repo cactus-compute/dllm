@@ -100,6 +100,84 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
     """Extended trainer with diagnostic logging during evaluation."""
 
+    def _init_diagnostic_accumulators(self):
+        """Initialize accumulators for averaging metrics across eval batches."""
+        steps = self.eval_integration_steps
+        self._diag_bucket_losses = [[] for _ in range(10)]  # 10 time buckets
+        self._diag_step_losses = [[] for _ in range(steps)]
+        self._diag_step_distances = [[] for _ in range(steps)]
+        self._diag_final_losses = []
+        self._diag_batch_count = 0
+
+    def evaluation_loop(self, dataloader, description, prediction_loss_only=None, ignore_keys=None, metric_key_prefix="eval"):
+        """Override to aggregate diagnostic metrics across batches and log once."""
+        # Initialize accumulators before evaluation
+        self._init_diagnostic_accumulators()
+
+        # Run the standard evaluation loop
+        output = super().evaluation_loop(
+            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
+        )
+
+        # After all batches, compute and log averages
+        if self.accelerator.is_main_process and self._diag_batch_count > 0:
+            steps = self.eval_integration_steps
+
+            # Average bucket losses
+            avg_bucket_losses = [
+                sum(self._diag_bucket_losses[i]) / len(self._diag_bucket_losses[i])
+                if self._diag_bucket_losses[i] else 0.0
+                for i in range(10)
+            ]
+
+            # Average step losses and distances
+            avg_step_losses = [
+                sum(self._diag_step_losses[i]) / len(self._diag_step_losses[i])
+                if self._diag_step_losses[i] else 0.0
+                for i in range(steps)
+            ]
+            avg_step_distances = [
+                sum(self._diag_step_distances[i]) / len(self._diag_step_distances[i])
+                if self._diag_step_distances[i] else 0.0
+                for i in range(steps)
+            ]
+
+            # Average final loss
+            avg_final_loss = (
+                sum(self._diag_final_losses) / len(self._diag_final_losses)
+                if self._diag_final_losses else 0.0
+            )
+
+            # Build log dict
+            all_logs = {}
+            for i in range(10):
+                all_logs[f"eval/loss_t_{i*10}-{(i+1)*10}pct"] = avg_bucket_losses[i]
+            for i in range(steps):
+                all_logs[f"eval/step_{i}_loss"] = avg_step_losses[i]
+                all_logs[f"eval/step_{i}_geodist"] = avg_step_distances[i]
+            all_logs["eval/final_loss"] = avg_final_loss
+
+            # Log once per evaluation
+            self.log(all_logs)
+
+            # Print summary
+            scaling_mode = "simple dt" if self.args.use_simple_dt else "endpoint (alpha_t_prime*dt/(1-alpha_t))"
+            eval_temp = getattr(self.args, 'eval_temperature', 0.0)
+            temp_str = f"{eval_temp}" if eval_temp > 0 else "none (1.0)"
+            print(f"\n=== Diagnostic Summary (averaged over {self._diag_batch_count} batches) ===")
+            print(f"Integration scaling: {scaling_mode}")
+            print(f"Eval temperature: {temp_str}")
+            print(f"Loss by time bucket (training-style):")
+            for i in range(10):
+                print(f"  t={i*10}-{(i+1)*10}%: {avg_bucket_losses[i]:.4f}")
+            print(f"\nLoss by integration step (eval-style):")
+            for i in range(0, steps, 4):
+                print(f"  step {i}: loss={avg_step_losses[i]:.4f}, geodist={avg_step_distances[i]:.4f}")
+            print(f"\nFinal eval loss: {avg_final_loss:.4f}")
+            print("=" * 50)
+
+        return output
+
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """
         Extended evaluation with diagnostic logging.
@@ -155,13 +233,9 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 masked_loss = (token_loss * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 bucket_losses.append(masked_loss.item())
 
-        # Log bucket losses
-        if hasattr(self, "_diagnostic_step"):
-            self._diagnostic_step += 1
-        else:
-            self._diagnostic_step = 0
-
-        bucket_log = {f"diag/loss_t_{i*10}-{(i+1)*10}pct": bucket_losses[i] for i in range(10)}
+        # Accumulate bucket losses (don't log per-batch)
+        for i in range(10):
+            self._diag_bucket_losses[i].append(bucket_losses[i])
 
         # ============================================================
         # DIAGNOSTIC 2: Loss at each integration step (multi-step, eval-style)
@@ -275,9 +349,10 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 mean_dist = (geodesic_dist * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_distances.append(mean_dist.item())
 
-        # Log step losses and distances
-        step_log = {f"diag/step_{i}_loss": step_losses[i] for i in range(steps)}
-        dist_log = {f"diag/step_{i}_geodist": step_distances[i] for i in range(steps)}
+        # Accumulate step losses and distances (don't log per-batch)
+        for i in range(steps):
+            self._diag_step_losses[i].append(step_losses[i])
+            self._diag_step_distances[i].append(step_distances[i])
 
         # Final eval (standard)
         final_probs = sphere_to_simplex(x_sphere)
@@ -297,36 +372,9 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
 
         loss = token_nll.sum() / loss_mask.sum().clamp_min(1)
 
-        # Log all diagnostics with eval_ prefix so wandb groups them correctly
-        all_logs = {}
-        for k, v in bucket_log.items():
-            all_logs[f"eval_{k.replace('diag/', '')}"] = v
-        for k, v in step_log.items():
-            all_logs[f"eval_{k.replace('diag/', '')}"] = v
-        for k, v in dist_log.items():
-            all_logs[f"eval_{k.replace('diag/', '')}"] = v
-        all_logs["eval_final_loss"] = loss.item()
-
-        # Only log on main process
-        if self.accelerator.is_main_process:
-            self.log(all_logs)
-
-            # Also print summary
-            if self._diagnostic_step % 5 == 0:
-                scaling_mode = "simple dt" if self.args.use_simple_dt else "endpoint (alpha_t_prime*dt/(1-alpha_t))"
-                eval_temp = getattr(self.args, 'eval_temperature', 0.0)
-                temp_str = f"{eval_temp}" if eval_temp > 0 else "none (1.0)"
-                print(f"\n=== Diagnostic Summary (eval step {self._diagnostic_step}) ===")
-                print(f"Integration scaling: {scaling_mode}")
-                print(f"Eval temperature: {temp_str}")
-                print(f"Loss by time bucket (training-style):")
-                for i in range(10):
-                    print(f"  t={i*10}-{(i+1)*10}%: {bucket_losses[i]:.4f}")
-                print(f"\nLoss by integration step (eval-style):")
-                for i in range(0, steps, 4):
-                    print(f"  step {i}: loss={step_losses[i]:.4f}, geodist={step_distances[i]:.4f}")
-                print(f"\nFinal eval loss: {loss.item():.4f}")
-                print("=" * 50)
+        # Accumulate final loss and increment batch count
+        self._diag_final_losses.append(loss.item())
+        self._diag_batch_count += 1
 
         if prediction_loss_only:
             return (loss.detach(), None, None)
