@@ -561,8 +561,8 @@ class BertSFMTrainer(transformers.Trainer):
         # we use an optimized path that avoids materializing the full x_1 tensor
         x_t = geodesic_interpolant_to_onehot(x_0, input_ids, alpha_t)  # [b, l, V]
 
-        # For MSE loss, we need x_0 to compute velocity target; for CE we can free it
-        if self.loss_type == "ce":
+        # For MSE loss (or hybrid CE+MSE), we need x_0 to compute velocity target; otherwise free it
+        if self.loss_type == "ce" and self.mse_loss_weight == 0:
             del x_0
 
         # === 3b. Keep prompt positions clean (not noised) ===
