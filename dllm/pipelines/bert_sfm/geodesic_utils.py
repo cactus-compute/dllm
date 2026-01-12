@@ -9,7 +9,71 @@ References:
 - Geodesics are great circle arcs on the sphere
 """
 
+import math
+
 import torch
+import torch.nn as nn
+
+
+# ============== Time Embedding ==============
+
+
+class TimeEmbedding(nn.Module):
+    """
+    Time embedding for flow matching using Gaussian Fourier features.
+
+    Architecture: t -> GaussianFourier -> Linear -> SiLU -> Linear -> output
+
+    The output is added to token embeddings to condition the model on timestep.
+    Following Fisher-Flow, we use hidden_size throughout (no bottleneck).
+
+    References:
+    - Fisher-Flow: https://github.com/fisher-flow/fisher-flow
+    - Gaussian Fourier features from score-based models
+    """
+
+    def __init__(self, hidden_size: int = 768, scale: float = 30.0):
+        """
+        Args:
+            hidden_size: Dimension of the embedding (should match model hidden size)
+            scale: Scale for Gaussian Fourier features (default 30.0 from Fisher-Flow)
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        # Gaussian Fourier features (fixed, not learned)
+        # These random frequencies help the model distinguish fine-grained time differences
+        self.register_buffer(
+            "W", torch.randn(hidden_size // 2) * scale
+        )
+
+        # MLP: Linear -> SiLU -> Linear
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Embed timestep t into hidden_size dimensions.
+
+        Args:
+            t: Timestep values, shape (B,) or (B, 1), values in [0, 1]
+
+        Returns:
+            Time embeddings, shape (B, hidden_size)
+        """
+        # Ensure t is 1D
+        t = t.view(-1)  # (B,)
+
+        # Gaussian Fourier features: sin and cos of random projections
+        # t[:, None] * W[None, :] gives (B, hidden_size // 2)
+        x_proj = t[:, None] * self.W[None, :] * 2 * math.pi
+        fourier = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)  # (B, hidden_size)
+
+        # Project through MLP
+        return self.mlp(fourier)  # (B, hidden_size)
 
 
 # ============== Manifold Operations ==============

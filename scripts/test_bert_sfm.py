@@ -6,11 +6,12 @@ import torch
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from dllm.pipelines.bert_sfm import BertSFMTrainer, BertSFMSampler, BertSFMSamplerConfig
-from dllm.pipelines.bert_sfm.trainer import (
-    geodesic_interpolant_to_onehot,
+from dllm.pipelines.bert_sfm.trainer import geodesic_interpolant_to_onehot
+from dllm.pipelines.bert_sfm.geodesic_utils import (
     geodesic_interpolant,
     uniform_prior,
     simplex_to_sphere,
+    TimeEmbedding,
 )
 
 
@@ -182,6 +183,9 @@ def test_bert_sfm():
         temperature=0.0,
     )
 
+    # Get time embedding from trainer (trained alongside model)
+    time_embedding = trainer.time_embedding
+
     # Test infill (mask filling)
     test_text = "The [MASK] sat on the [MASK]."
     print(f"\nInfill test: '{test_text}'")
@@ -189,7 +193,7 @@ def test_bert_sfm():
     test_ids = tokenizer.encode(test_text, return_tensors="pt").to(device)
     print(f"Input token IDs: {test_ids.tolist()}")
 
-    output = sampler.infill([test_ids[0]], config=config)
+    output = sampler.infill([test_ids[0]], config=config, time_embedding=time_embedding)
     output_text = tokenizer.decode(output[0], skip_special_tokens=True)
     print(f"Output: '{output_text}'")
 
@@ -198,7 +202,7 @@ def test_bert_sfm():
     print(f"\nGeneration test: '{prompt}'")
 
     prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    output = sampler.sample([prompt_ids[0]], config=config)
+    output = sampler.sample([prompt_ids[0]], config=config, time_embedding=time_embedding)
     output_text = tokenizer.decode(output[0], skip_special_tokens=True)
     print(f"Output: '{output_text}'")
 
@@ -304,6 +308,9 @@ def test_overfit_single_sentence():
         temperature=0.0,  # Greedy
     )
 
+    # Get time embedding from trainer
+    time_embedding = trainer.time_embedding
+
     # Create input with all masks (same length as target)
     target_ids = tokenizer.encode(target_sentence, return_tensors="pt")[0]
     num_tokens = len(target_ids)
@@ -323,7 +330,7 @@ def test_overfit_single_sentence():
 
     # Run infill
     all_mask_ids = all_mask_ids.to(device)
-    output = sampler.infill([all_mask_ids], config=config)
+    output = sampler.infill([all_mask_ids], config=config, time_embedding=time_embedding)
     output_text = tokenizer.decode(output[0], skip_special_tokens=True)
 
     print(f"\nGenerated: '{output_text}'")
@@ -456,6 +463,9 @@ def test_overfit_multiple_sentences():
         temperature=0.0,  # Greedy
     )
 
+    # Get time embedding from trainer
+    time_embedding = trainer.time_embedding
+
     # Normalize sentences for comparison
     normalized_sentences = set(s.lower().strip() for s in sentences)
 
@@ -482,7 +492,7 @@ def test_overfit_multiple_sentences():
                 max_new_tokens=8,
                 temperature=0.5 if trial > 0 else 0.0,
             )
-            output = sampler.infill([mask_tensor], config=temp_config)
+            output = sampler.infill([mask_tensor], config=temp_config, time_embedding=time_embedding)
             output_text = tokenizer.decode(output[0], skip_special_tokens=True)
             normalized_output = output_text.lower().strip()
 

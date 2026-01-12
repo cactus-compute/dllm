@@ -33,6 +33,7 @@ from dllm.pipelines.bert_sfm.geodesic_utils import (
     linear_schedule,
     cosine_schedule,
     mse_velocity_loss_to_onehot,
+    TimeEmbedding,
 )
 
 
@@ -128,7 +129,7 @@ class BertSFMTrainer(transformers.Trainer):
         embed_type: str = "spherical"  # "spherical" or "simplex"
         loss_type: str = "ce"  # "ce" (cross-entropy) or "mse" (velocity MSE)
         eval_integration_steps: int = 20  # Number of integration steps for evaluation
-        weight_decay: float = 0.01  # AdamW weight decay (L2 regularization)
+        weight_decay: float = 0.1  # AdamW weight decay (L2 regularization)
         # Dataloader optimizations - defaults set based on CUDA availability
         dataloader_num_workers: int = 8 if torch.cuda.is_available() else 0
         dataloader_pin_memory: bool = torch.cuda.is_available()
@@ -156,6 +157,11 @@ class BertSFMTrainer(transformers.Trainer):
         # velocity MSE loss as a regularizer to the CE loss.
         # 0 = disabled (pure CE), try 0.1-1.0 for hybrid training
         mse_loss_weight: float = 0.0
+        # Time embedding: condition the model on timestep t
+        # This is critical for flow matching - the model needs to know where on the
+        # trajectory it currently is to make proper predictions.
+        use_time_embedding: bool = True  # Enable time conditioning
+        time_embedding_scale: float = 30.0  # Scale for Gaussian Fourier features
 
     def __init__(
         self,
@@ -196,6 +202,10 @@ class BertSFMTrainer(transformers.Trainer):
         self.geodesic_loss_weight = args.geodesic_loss_weight
         # Hybrid MSE loss weight
         self.mse_loss_weight = args.mse_loss_weight
+        # Time embedding
+        self.use_time_embedding = args.use_time_embedding
+        self.time_embedding_scale = args.time_embedding_scale
+        self.time_embedding = None  # Initialized lazily in compute_loss when we know hidden_size
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -464,6 +474,7 @@ class BertSFMTrainer(transformers.Trainer):
             temperature=0.0,
             inference_scaling=1.0,
             return_histories=False,
+            time_embedding=self.time_embedding if self.use_time_embedding else None,
         )
         del context_embeds
 
@@ -610,6 +621,20 @@ class BertSFMTrainer(transformers.Trainer):
         # x_embed: [b, l, V], embed_weight: [V, D] -> [b, l, D]
         # Ensure dtype matches embedding layer (important for mixed precision training)
         soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
+
+        # === 5b. Add time embedding ===
+        # Condition the model on timestep t so it knows where on the trajectory it is
+        if self.use_time_embedding:
+            # Lazy initialization of time embedding (need to know hidden_size)
+            if self.time_embedding is None:
+                hidden_size = embed_layer.weight.shape[1]
+                self.time_embedding = TimeEmbedding(
+                    hidden_size=hidden_size,
+                    scale=self.time_embedding_scale,
+                ).to(device=device, dtype=compute_dtype)
+            # Add time embedding to all token positions
+            time_emb = self.time_embedding(t)  # (B, hidden_size)
+            soft_embeddings = soft_embeddings + time_emb.unsqueeze(1)  # (B, L, D) + (B, 1, D)
 
         # Forward pass with soft embeddings
         # Most HuggingFace models accept inputs_embeds

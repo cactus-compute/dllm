@@ -27,6 +27,7 @@ from dllm.pipelines.bert_sfm.geodesic_utils import (
     uniform_prior,
     linear_schedule,
     cosine_schedule,
+    TimeEmbedding,
 )
 
 
@@ -91,6 +92,7 @@ class BertSFMSampler(BaseSampler):
         temperature: float,
         inference_scaling: float,
         return_histories: bool = False,
+        time_embedding: TimeEmbedding | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """
         Core flow integration loop on the Fisher-Rao manifold.
@@ -112,6 +114,7 @@ class BertSFMSampler(BaseSampler):
             temperature: Temperature for logits (0 = greedy).
             inference_scaling: Scaling factor for step sizes.
             return_histories: Whether to record token history at each step.
+            time_embedding: Optional TimeEmbedding module for conditioning on timestep.
 
         Returns:
             Tuple of (final_x_sphere, histories) where histories is None if
@@ -151,6 +154,14 @@ class BertSFMSampler(BaseSampler):
 
             # Use discrete embeddings for context, soft embeddings for flow positions (in-place)
             soft_embeddings[~flow_mask] = context_embeds[~flow_mask]
+
+            # Add time embedding if provided
+            if time_embedding is not None:
+                # t_curr is scalar, expand to batch size
+                batch_size = x_sphere.shape[0]
+                t_batch = t_curr.expand(batch_size)  # (B,)
+                time_emb = time_embedding(t_batch)  # (B, hidden_size)
+                soft_embeddings = soft_embeddings + time_emb.unsqueeze(1)  # (B, T, D) + (B, 1, D)
 
             # Model forward pass
             outputs = self.model(
@@ -227,6 +238,7 @@ class BertSFMSampler(BaseSampler):
         self,
         inputs: list[torch.Tensor | list],
         config: BertSFMSamplerConfig | None = None,
+        time_embedding: TimeEmbedding | None = None,
         **kwargs,
     ) -> SamplerOutput | torch.Tensor:
         """
@@ -238,6 +250,7 @@ class BertSFMSampler(BaseSampler):
         Args:
             inputs: List of input prompts (token tensors or lists of token IDs).
             config: Sampler configuration, or None to use defaults.
+            time_embedding: Optional TimeEmbedding module for conditioning on timestep.
             **kwargs: Override specific config parameters.
 
         Returns:
@@ -315,6 +328,7 @@ class BertSFMSampler(BaseSampler):
             temperature=temperature,
             inference_scaling=inference_scaling,
             return_histories=return_dict,
+            time_embedding=time_embedding,
         )
 
         # Convert final sphere points to tokens
@@ -334,6 +348,7 @@ class BertSFMSampler(BaseSampler):
         self,
         inputs: list[torch.Tensor | list],
         config: BertSFMSamplerConfig | None = None,
+        time_embedding: TimeEmbedding | None = None,
         **kwargs,
     ) -> SamplerOutput | torch.Tensor:
         """
@@ -344,6 +359,7 @@ class BertSFMSampler(BaseSampler):
         Args:
             inputs: List of sequences containing mask tokens to fill.
             config: Sampler configuration, or None to use defaults.
+            time_embedding: Optional TimeEmbedding module for conditioning on timestep.
             **kwargs: Override specific config parameters.
 
         Returns:
@@ -424,6 +440,7 @@ class BertSFMSampler(BaseSampler):
             temperature=temperature,
             inference_scaling=inference_scaling,
             return_histories=return_dict,
+            time_embedding=time_embedding,
         )
 
         # Convert final sphere points to tokens
