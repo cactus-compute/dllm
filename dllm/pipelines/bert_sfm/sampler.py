@@ -161,7 +161,8 @@ class BertSFMSampler(BaseSampler):
                 batch_size = x_sphere.shape[0]
                 t_batch = t_curr.expand(batch_size)  # (B,)
                 time_emb = time_embedding(t_batch)  # (B, hidden_size)
-                soft_embeddings = soft_embeddings + time_emb.unsqueeze(1)  # (B, T, D) + (B, 1, D)
+                # Ensure dtype matches soft_embeddings (important for mixed precision)
+                soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
 
             # Model forward pass
             outputs = self.model(

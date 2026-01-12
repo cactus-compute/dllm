@@ -633,8 +633,10 @@ class BertSFMTrainer(transformers.Trainer):
                     scale=self.time_embedding_scale,
                 ).to(device=device, dtype=compute_dtype)
             # Add time embedding to all token positions
-            time_emb = self.time_embedding(t)  # (B, hidden_size)
-            soft_embeddings = soft_embeddings + time_emb.unsqueeze(1)  # (B, L, D) + (B, 1, D)
+            # Ensure t is on correct device (it's created on CPU with torch.rand)
+            time_emb = self.time_embedding(t.to(device))  # (B, hidden_size)
+            # Ensure dtype matches soft_embeddings (important for mixed precision)
+            soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
 
         # Forward pass with soft embeddings
         # Most HuggingFace models accept inputs_embeds

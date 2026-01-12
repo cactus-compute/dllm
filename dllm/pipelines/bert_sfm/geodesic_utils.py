@@ -72,6 +72,10 @@ class TimeEmbedding(nn.Module):
         x_proj = t[:, None] * self.W[None, :] * 2 * math.pi
         fourier = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)  # (B, hidden_size)
 
+        # Cast fourier to match MLP weights dtype (important for mixed precision training)
+        mlp_dtype = next(self.mlp.parameters()).dtype
+        fourier = fourier.to(mlp_dtype)
+
         # Project through MLP
         return self.mlp(fourier)  # (B, hidden_size)
 
