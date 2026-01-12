@@ -150,6 +150,11 @@ class BertSFMTrainer(transformers.Trainer):
         # the true endpoint on the sphere. This aligns training with inference behavior.
         # 0 = disabled, try 0.1-1.0 for moderate regularization
         geodesic_loss_weight: float = 0.0
+        # Hybrid loss: combine CE (endpoint) and MSE (velocity) losses
+        # This is more principled than geodesic_loss - it adds the standard flow matching
+        # velocity MSE loss as a regularizer to the CE loss.
+        # 0 = disabled (pure CE), try 0.1-1.0 for hybrid training
+        mse_loss_weight: float = 0.0
 
     def __init__(
         self,
@@ -188,6 +193,8 @@ class BertSFMTrainer(transformers.Trainer):
         self.eval_step_weight_cap = args.eval_step_weight_cap
         # Geodesic loss
         self.geodesic_loss_weight = args.geodesic_loss_weight
+        # Hybrid MSE loss weight
+        self.mse_loss_weight = args.mse_loss_weight
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -650,6 +657,28 @@ class BertSFMTrainer(transformers.Trainer):
 
                 # Add to token_loss with weighting
                 token_loss = token_loss + self.geodesic_loss_weight * geodesic_loss_per_token
+
+            # === 7c. Optional: Hybrid MSE loss for velocity regularization ===
+            # This adds the standard flow matching MSE velocity loss as a regularizer.
+            # The CE loss teaches the model to predict the correct endpoint (token),
+            # while the MSE loss teaches proper velocity/geometry on the sphere.
+            if self.mse_loss_weight > 0:
+                # Construct x_1 (one-hot on sphere) for target positions
+                x_1 = F.one_hot(input_ids, num_classes=vocab_size).to(compute_dtype)  # [b, l, V]
+
+                # Compute target velocity: log_map(x_0, x_1) parallel transported to x_t
+                velocity_at_x0 = log_map(x_0, x_1)  # [b, l, V]
+                target_velocity = parallel_transport(x_0, x_t, velocity_at_x0)  # [b, l, V]
+
+                # Project model output (logits) to tangent space at x_t
+                # For CE mode, we interpret the logits as velocity when computing MSE
+                predicted_velocity = make_tangent(x_t, logits)  # [b, l, V]
+
+                # MSE loss per token: sum over vocab dimension
+                mse_loss_per_token = (predicted_velocity - target_velocity).square().sum(dim=-1)  # [b, l]
+
+                # Add to token_loss with weighting
+                token_loss = token_loss + self.mse_loss_weight * mse_loss_per_token
 
         elif self.loss_type == "mse":
             # Velocity MSE loss: target is the velocity (tangent vector)

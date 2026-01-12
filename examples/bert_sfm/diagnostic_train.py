@@ -86,6 +86,10 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     # Geodesic loss: auxiliary loss to align CE training with inference
     # 0 = disabled, try 0.1-1.0 for moderate regularization
     geodesic_loss_weight: float = 0.0
+    # Hybrid MSE loss: add velocity MSE as auxiliary loss alongside CE
+    # More principled than geodesic loss - combines CE's strength with MSE's geometry
+    # 0 = disabled (pure CE), try 0.1-1.0 for hybrid training
+    mse_loss_weight: float = 0.0
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
