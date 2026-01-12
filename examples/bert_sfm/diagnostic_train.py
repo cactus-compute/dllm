@@ -90,6 +90,11 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     # More principled than geodesic loss - combines CE's strength with MSE's geometry
     # 0 = disabled (pure CE), try 0.1-1.0 for hybrid training
     mse_loss_weight: float = 0.0
+    # Temperature for evaluation inference (logits / temperature)
+    # temperature < 1.0 = sharper predictions, temperature > 1.0 = softer
+    # 0 = no temperature scaling (equivalent to temperature=1.0)
+    # Try values like 0.1, 0.2, 0.5 to sharpen predictions during integration
+    eval_temperature: float = 0.0
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
@@ -230,6 +235,12 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 x_0_gt = prior_sample  # Same noise we started with
                 x_t_gt = geodesic_interpolant_to_onehot(x_0_gt, input_ids, t_next.unsqueeze(0).expand(b))
 
+                # Apply temperature scaling for integration (logits / temperature)
+                # temperature < 1.0 sharpens predictions, > 1.0 softens them
+                eval_temp = getattr(self.args, 'eval_temperature', 0.0)
+                if eval_temp > 0:
+                    logits = logits / eval_temp
+
                 # Take integration step - different for CE vs MSE
                 if self.loss_type == "mse":
                     # MSE/Velocity prediction: logits are velocity, project to tangent space
@@ -303,8 +314,11 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             # Also print summary
             if self._diagnostic_step % 5 == 0:
                 scaling_mode = "simple dt" if self.args.use_simple_dt else "endpoint (alpha_t_prime*dt/(1-alpha_t))"
+                eval_temp = getattr(self.args, 'eval_temperature', 0.0)
+                temp_str = f"{eval_temp}" if eval_temp > 0 else "none (1.0)"
                 print(f"\n=== Diagnostic Summary (eval step {self._diagnostic_step}) ===")
                 print(f"Integration scaling: {scaling_mode}")
+                print(f"Eval temperature: {temp_str}")
                 print(f"Loss by time bucket (training-style):")
                 for i in range(10):
                     print(f"  t={i*10}-{(i+1)*10}%: {bucket_losses[i]:.4f}")
