@@ -32,6 +32,7 @@ from dllm.pipelines.bert_sfm.geodesic_utils import (
     uniform_prior,
     linear_schedule,
     cosine_schedule,
+    mse_velocity_loss_to_onehot,
 )
 
 
@@ -662,20 +663,16 @@ class BertSFMTrainer(transformers.Trainer):
             # This adds the standard flow matching MSE velocity loss as a regularizer.
             # The CE loss teaches the model to predict the correct endpoint (token),
             # while the MSE loss teaches proper velocity/geometry on the sphere.
+            # Uses memory-efficient computation that exploits one-hot structure of x_1.
             if self.mse_loss_weight > 0:
-                # Construct x_1 (one-hot on sphere) for target positions
-                x_1 = F.one_hot(input_ids, num_classes=vocab_size).to(compute_dtype)  # [b, l, V]
-
-                # Compute target velocity: log_map(x_0, x_1) parallel transported to x_t
-                velocity_at_x0 = log_map(x_0, x_1)  # [b, l, V]
-                target_velocity = parallel_transport(x_0, x_t, velocity_at_x0)  # [b, l, V]
-
                 # Project model output (logits) to tangent space at x_t
-                # For CE mode, we interpret the logits as velocity when computing MSE
                 predicted_velocity = make_tangent(x_t, logits)  # [b, l, V]
 
-                # MSE loss per token: sum over vocab dimension
-                mse_loss_per_token = (predicted_velocity - target_velocity).square().sum(dim=-1)  # [b, l]
+                # Use memory-efficient MSE that doesn't materialize full (b, l, V) tensors
+                # for x_1, log_map, or parallel transport
+                mse_loss_per_token = mse_velocity_loss_to_onehot(
+                    x_0, x_t, input_ids, predicted_velocity
+                )  # [b, l]
 
                 # Add to token_loss with weighting
                 token_loss = token_loss + self.mse_loss_weight * mse_loss_per_token
