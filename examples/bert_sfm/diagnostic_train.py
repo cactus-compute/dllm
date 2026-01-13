@@ -11,6 +11,7 @@ Usage:
     python examples/bert_sfm/diagnostic_train.py
 """
 
+import math
 import os
 from dataclasses import dataclass, field
 from functools import partial
@@ -107,6 +108,7 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         self._diag_step_losses = [[] for _ in range(steps)]
         self._diag_step_distances = [[] for _ in range(steps)]
         self._diag_step_tvs = [[] for _ in range(steps)]  # Total variation per step
+        self._diag_step_entropies = [[] for _ in range(steps)]  # Entropy per step
         self._diag_final_losses = []
         self._diag_batch_count = 0
 
@@ -131,7 +133,7 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 for i in range(10)
             ]
 
-            # Average step losses, distances, and TVs
+            # Average step losses, distances, TVs, and entropies
             avg_step_losses = [
                 sum(self._diag_step_losses[i]) / len(self._diag_step_losses[i])
                 if self._diag_step_losses[i] else 0.0
@@ -147,12 +149,21 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 if self._diag_step_tvs[i] else 0.0
                 for i in range(steps)
             ]
+            avg_step_entropies = [
+                sum(self._diag_step_entropies[i]) / len(self._diag_step_entropies[i])
+                if self._diag_step_entropies[i] else 0.0
+                for i in range(steps)
+            ]
 
             # Average final loss
             avg_final_loss = (
                 sum(self._diag_final_losses) / len(self._diag_final_losses)
                 if self._diag_final_losses else 0.0
             )
+
+            # Compute max entropy for percentage calculation
+            unwrapped_model = self.model.module if hasattr(self.model, "module") else self.model
+            max_entropy = math.log(unwrapped_model.config.vocab_size)
 
             # Build log dict
             all_logs = {}
@@ -162,8 +173,12 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 all_logs[f"eval/step_{i}_loss"] = avg_step_losses[i]
                 all_logs[f"eval/step_{i}_geodist"] = avg_step_distances[i]
                 all_logs[f"eval/step_{i}_tv"] = avg_step_tvs[i]
+                all_logs[f"eval/step_{i}_entropy"] = avg_step_entropies[i]
+                all_logs[f"eval/step_{i}_entropy_pct"] = 100.0 * avg_step_entropies[i] / max_entropy
             all_logs["eval/final_loss"] = avg_final_loss
             all_logs["eval/mean_step_tv"] = sum(avg_step_tvs) / len(avg_step_tvs) if avg_step_tvs else 0.0
+            all_logs["eval/mean_step_entropy"] = sum(avg_step_entropies) / len(avg_step_entropies) if avg_step_entropies else 0.0
+            all_logs["eval/mean_step_entropy_pct"] = 100.0 * all_logs["eval/mean_step_entropy"] / max_entropy
 
             # Log once per evaluation
             self.log(all_logs)
@@ -180,9 +195,12 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 print(f"  t={i*10}-{(i+1)*10}%: {avg_bucket_losses[i]:.4f}")
             print(f"\nLoss by integration step (eval-style):")
             for i in range(0, steps, 4):
-                print(f"  step {i}: loss={avg_step_losses[i]:.4f}, geodist={avg_step_distances[i]:.4f}, tv={avg_step_tvs[i]:.4f}")
+                entropy_pct = 100.0 * avg_step_entropies[i] / max_entropy
+                print(f"  step {i}: loss={avg_step_losses[i]:.4f}, geodist={avg_step_distances[i]:.4f}, tv={avg_step_tvs[i]:.4f}, entropy={entropy_pct:.1f}%")
             print(f"\nFinal eval loss: {avg_final_loss:.4f}")
             print(f"Mean step TV: {sum(avg_step_tvs) / len(avg_step_tvs):.4f}")
+            mean_entropy_pct = 100.0 * sum(avg_step_entropies) / len(avg_step_entropies) / max_entropy if avg_step_entropies else 0.0
+            print(f"Mean step entropy: {mean_entropy_pct:.1f}% of max (low = confident, high = uncertain)")
             print("=" * 50)
 
         return output
@@ -267,6 +285,7 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         step_losses = []
         step_distances = []
         step_tvs = []
+        step_entropies = []
 
         # Pre-expand flow_mask
         flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_sphere)
@@ -372,11 +391,20 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 mean_tv = (tv_per_pos * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_tvs.append(mean_tv.item())
 
-        # Accumulate step losses, distances, and TVs (don't log per-batch)
+                # Compute entropy of predicted distribution
+                # H(p) = -sum(p * log(p)), measures model uncertainty
+                # Low entropy = confident (peaked), high entropy = uncertain (spread out)
+                # This helps diagnose if expected_logmap_to_onehots would help
+                entropy_per_pos = -(p_pred * p_pred.clamp(min=1e-8).log()).sum(dim=-1)  # [b, l]
+                mean_entropy = (entropy_per_pos * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                step_entropies.append(mean_entropy.item())
+
+        # Accumulate step losses, distances, TVs, and entropies (don't log per-batch)
         for i in range(steps):
             self._diag_step_losses[i].append(step_losses[i])
             self._diag_step_distances[i].append(step_distances[i])
             self._diag_step_tvs[i].append(step_tvs[i])
+            self._diag_step_entropies[i].append(step_entropies[i])
 
         # Final eval (standard)
         final_probs = sphere_to_simplex(x_sphere)
