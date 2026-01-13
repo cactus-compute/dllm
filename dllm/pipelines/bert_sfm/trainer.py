@@ -160,7 +160,7 @@ class BertSFMTrainer(transformers.Trainer):
         # Time embedding: condition the model on timestep t
         # This is critical for flow matching - the model needs to know where on the
         # trajectory it currently is to make proper predictions.
-        use_time_embedding: bool = True  # Enable time conditioning
+        use_time_embedding: bool = False  # Enable time conditioning
         time_embedding_scale: float = 30.0  # Scale for Gaussian Fourier features
 
     def __init__(

@@ -106,6 +106,7 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         self._diag_bucket_losses = [[] for _ in range(10)]  # 10 time buckets
         self._diag_step_losses = [[] for _ in range(steps)]
         self._diag_step_distances = [[] for _ in range(steps)]
+        self._diag_step_tvs = [[] for _ in range(steps)]  # Total variation per step
         self._diag_final_losses = []
         self._diag_batch_count = 0
 
@@ -130,7 +131,7 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 for i in range(10)
             ]
 
-            # Average step losses and distances
+            # Average step losses, distances, and TVs
             avg_step_losses = [
                 sum(self._diag_step_losses[i]) / len(self._diag_step_losses[i])
                 if self._diag_step_losses[i] else 0.0
@@ -139,6 +140,11 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             avg_step_distances = [
                 sum(self._diag_step_distances[i]) / len(self._diag_step_distances[i])
                 if self._diag_step_distances[i] else 0.0
+                for i in range(steps)
+            ]
+            avg_step_tvs = [
+                sum(self._diag_step_tvs[i]) / len(self._diag_step_tvs[i])
+                if self._diag_step_tvs[i] else 0.0
                 for i in range(steps)
             ]
 
@@ -155,7 +161,9 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             for i in range(steps):
                 all_logs[f"eval/step_{i}_loss"] = avg_step_losses[i]
                 all_logs[f"eval/step_{i}_geodist"] = avg_step_distances[i]
+                all_logs[f"eval/step_{i}_tv"] = avg_step_tvs[i]
             all_logs["eval/final_loss"] = avg_final_loss
+            all_logs["eval/mean_step_tv"] = sum(avg_step_tvs) / len(avg_step_tvs) if avg_step_tvs else 0.0
 
             # Log once per evaluation
             self.log(all_logs)
@@ -172,8 +180,9 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 print(f"  t={i*10}-{(i+1)*10}%: {avg_bucket_losses[i]:.4f}")
             print(f"\nLoss by integration step (eval-style):")
             for i in range(0, steps, 4):
-                print(f"  step {i}: loss={avg_step_losses[i]:.4f}, geodist={avg_step_distances[i]:.4f}")
+                print(f"  step {i}: loss={avg_step_losses[i]:.4f}, geodist={avg_step_distances[i]:.4f}, tv={avg_step_tvs[i]:.4f}")
             print(f"\nFinal eval loss: {avg_final_loss:.4f}")
+            print(f"Mean step TV: {sum(avg_step_tvs) / len(avg_step_tvs):.4f}")
             print("=" * 50)
 
         return output
@@ -257,9 +266,13 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         timesteps = torch.linspace(0, 1, steps + 1, device=device)
         step_losses = []
         step_distances = []
+        step_tvs = []
 
         # Pre-expand flow_mask
         flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_sphere)
+
+        # Track previous probability distribution for TV computation
+        p_prev = sphere_to_simplex(x_sphere).clone()
 
         for step_idx in range(steps):
             t_curr = timesteps[step_idx]
@@ -349,10 +362,19 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 mean_dist = (geodesic_dist * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_distances.append(mean_dist.item())
 
-        # Accumulate step losses and distances (don't log per-batch)
+                # Compute total variation between this step and previous
+                # TV = 0.5 * sum(|p_t - p_{t-1}|) averaged over flow positions
+                p_curr = sphere_to_simplex(x_sphere)
+                tv_per_pos = 0.5 * (p_curr - p_prev).abs().sum(dim=-1)  # [b, l]
+                mean_tv = (tv_per_pos * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                step_tvs.append(mean_tv.item())
+                p_prev = p_curr
+
+        # Accumulate step losses, distances, and TVs (don't log per-batch)
         for i in range(steps):
             self._diag_step_losses[i].append(step_losses[i])
             self._diag_step_distances[i].append(step_distances[i])
+            self._diag_step_tvs[i].append(step_tvs[i])
 
         # Final eval (standard)
         final_probs = sphere_to_simplex(x_sphere)
