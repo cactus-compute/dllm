@@ -48,11 +48,16 @@ class TimeEmbedding(nn.Module):
         )
 
         # MLP: Linear -> SiLU -> Linear
+        # Zero-initialize the final layer so time embedding starts as no-op
+        # and the model gradually learns to use it (residual-style warmup)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
+        # Zero init final layer weights and bias
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
