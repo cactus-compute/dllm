@@ -271,9 +271,6 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         # Pre-expand flow_mask
         flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_sphere)
 
-        # Track previous probability distribution for TV computation
-        p_prev = sphere_to_simplex(x_sphere).clone()
-
         for step_idx in range(steps):
             t_curr = timesteps[step_idx]
             t_next = timesteps[step_idx + 1]
@@ -305,6 +302,9 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             )
 
             with torch.no_grad():
+                # Save x_sphere before step for TV computation
+                x_sphere_before_step = x_sphere.clone()
+
                 outputs = model(inputs_embeds=soft_embeddings, attention_mask=attention_mask)
                 logits = outputs.logits
 
@@ -362,13 +362,15 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 mean_dist = (geodesic_dist * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_distances.append(mean_dist.item())
 
-                # Compute total variation between this step and previous
-                # TV = 0.5 * sum(|p_t - p_{t-1}|) averaged over flow positions
-                p_curr = sphere_to_simplex(x_sphere)
-                tv_per_pos = 0.5 * (p_curr - p_prev).abs().sum(dim=-1)  # [b, l]
+                # Compute total variation between model's predicted distribution and input
+                # TV = 0.5 * sum(|p_pred - p_input|) averaged over flow positions
+                # p_input is the distribution BEFORE the step (x_sphere before update)
+                # p_pred is the model's endpoint prediction (softmax of logits)
+                p_input = sphere_to_simplex(x_sphere_before_step)
+                p_pred = F.softmax(logits, dim=-1)
+                tv_per_pos = 0.5 * (p_pred - p_input).abs().sum(dim=-1)  # [b, l]
                 mean_tv = (tv_per_pos * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_tvs.append(mean_tv.item())
-                p_prev = p_curr
 
         # Accumulate step losses, distances, and TVs (don't log per-batch)
         for i in range(steps):
