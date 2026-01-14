@@ -32,6 +32,8 @@ from dllm.pipelines.bert_sfm.geodesic_utils import (
     geodesic_interpolant,
     exp_map,
     make_tangent,
+    expected_logmap_to_onehots,
+    log_map,
 )
 from dllm.pipelines.bert_sfm.trainer import geodesic_interpolant_to_onehot
 
@@ -96,6 +98,11 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     # 0 = no temperature scaling (equivalent to temperature=1.0)
     # Try values like 0.1, 0.2, 0.5 to sharpen predictions during integration
     eval_temperature: float = 0.0
+    # Use expected_logmap_to_onehots instead of log_map(x_t, sqrt(probs))
+    # This computes the mathematically correct expected direction toward a categorical
+    # distribution, accounting for the nonlinearity of log_map on the sphere.
+    # May reduce error accumulation during integration when predictions are uncertain.
+    use_expected_logmap: bool = False
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
@@ -187,9 +194,12 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             scaling_mode = "simple dt" if self.args.use_simple_dt else "endpoint (alpha_t_prime*dt/(1-alpha_t))"
             eval_temp = getattr(self.args, 'eval_temperature', 0.0)
             temp_str = f"{eval_temp}" if eval_temp > 0 else "none (1.0)"
+            use_expected_logmap = getattr(self.args, 'use_expected_logmap', False)
+            logmap_mode = "expected_logmap_to_onehots" if use_expected_logmap else "log_map(x_t, sqrt(probs))"
             print(f"\n=== Diagnostic Summary (averaged over {self._diag_batch_count} batches) ===")
             print(f"Integration scaling: {scaling_mode}")
             print(f"Eval temperature: {temp_str}")
+            print(f"Log map mode: {logmap_mode}")
             print(f"Loss by time bucket (training-style):")
             for i in range(10):
                 print(f"  t={i*10}-{(i+1)*10}%: {avg_bucket_losses[i]:.4f}")
@@ -354,17 +364,24 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                     # For velocity prediction, use simple dt scaling
                     tangent = velocity * dt
                 else:
-                    # CE/Endpoint prediction: logits -> probs -> sqrt -> sphere point
+                    # CE/Endpoint prediction: logits -> probs -> sphere point
                     probs = F.softmax(logits, dim=-1)
-                    x_1_pred = probs.sqrt()
 
-                    # Log map and exp map for geodesic step
-                    dot_pq = (x_sphere * x_1_pred).sum(dim=-1, keepdim=True)
-                    q_proj = x_1_pred - dot_pq * x_sphere
-                    q_proj_norm = torch.norm(q_proj, dim=-1, keepdim=True).clamp(min=1e-8)
-                    dot_clamped = dot_pq.clamp(-1 + 1e-7, 1 - 1e-7)
-                    dist = torch.acos(dot_clamped)
-                    tangent = q_proj / q_proj_norm * dist * step_weight
+                    # Check if we should use expected_logmap_to_onehots
+                    use_expected_logmap = getattr(self.args, 'use_expected_logmap', False)
+                    if use_expected_logmap:
+                        # Use expected_logmap_to_onehots: mathematically correct expected direction
+                        tangent = expected_logmap_to_onehots(x_sphere, probs) * step_weight
+                    else:
+                        # Standard approach: log_map(x_t, sqrt(probs))
+                        x_1_pred = probs.sqrt()
+                        # Log map for geodesic step
+                        dot_pq = (x_sphere * x_1_pred).sum(dim=-1, keepdim=True)
+                        q_proj = x_1_pred - dot_pq * x_sphere
+                        q_proj_norm = torch.norm(q_proj, dim=-1, keepdim=True).clamp(min=1e-8)
+                        dot_clamped = dot_pq.clamp(-1 + 1e-7, 1 - 1e-7)
+                        dist = torch.acos(dot_clamped)
+                        tangent = q_proj / q_proj_norm * dist * step_weight
 
                 # Apply exp_map to get new position
                 v_norm = torch.norm(tangent, dim=-1, keepdim=True).clamp(min=1e-8)

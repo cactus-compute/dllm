@@ -18,6 +18,7 @@ from dllm.core.samplers.base import BaseSampler, SamplerConfig, SamplerOutput
 from dllm.pipelines.bert_sfm.geodesic_utils import (
     exp_map,
     exp_map_inplace,
+    expected_logmap_to_onehots,
     log_map,
     log_map_inplace,
     make_tangent,
@@ -49,6 +50,11 @@ class BertSFMSamplerConfig(SamplerConfig):
     # Step weight capping to prevent blow-up near t=1
     # Set to 0 to disable capping, otherwise caps step_weight at this multiple of dt
     step_weight_cap: float = 0.0  # 0 = no cap, e.g. 4.0 = cap at 4x dt
+    # Use expected_logmap_to_onehots instead of log_map(x_t, sqrt(probs))
+    # This is mathematically more correct for computing the expected direction
+    # toward a categorical distribution, accounting for log_map nonlinearity.
+    # May reduce error accumulation during integration when predictions are uncertain.
+    use_expected_logmap: bool = False
 
 
 # ============== Sampler ==============
@@ -185,9 +191,6 @@ class BertSFMSampler(BaseSampler):
                 # Softmax then sqrt to get sphere point
                 probs = F.softmax(logits, dim=-1)
                 del logits
-                # x_1_pred = sqrt(probs), in-place sqrt
-                x_1_pred = probs.sqrt_()
-                del probs  # Clean up reference (x_1_pred holds the data)
 
                 # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
                 step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5)) * inference_scaling
@@ -199,11 +202,23 @@ class BertSFMSampler(BaseSampler):
                     max_weight = step_weight_cap * dt
                     step_weight = min(step_weight, max_weight)
 
-                # Step along geodesic toward predicted endpoint
-                # log_map_inplace stores result in x_1_pred (now becomes tangent)
-                tangent = log_map_inplace(x_sphere, x_1_pred)
-                # Scale tangent in-place
-                tangent.mul_(step_weight)
+                # Compute tangent vector toward predicted endpoint
+                use_expected_logmap = getattr(config, "use_expected_logmap", False)
+                if use_expected_logmap:
+                    # Use expected_logmap_to_onehots: mathematically correct expected direction
+                    # that accounts for log_map nonlinearity over the categorical distribution
+                    tangent = expected_logmap_to_onehots(x_sphere, probs)
+                    tangent.mul_(step_weight)
+                    del probs
+                else:
+                    # Standard approach: log_map(x_t, sqrt(probs))
+                    # x_1_pred = sqrt(probs), in-place sqrt
+                    x_1_pred = probs.sqrt_()
+                    del probs  # Clean up reference (x_1_pred holds the data)
+                    # log_map_inplace stores result in x_1_pred (now becomes tangent)
+                    tangent = log_map_inplace(x_sphere, x_1_pred)
+                    tangent.mul_(step_weight)
+
                 # exp_map_inplace stores result in tangent (now becomes x_sphere_new)
                 x_sphere_new = exp_map_inplace(x_sphere, tangent)
                 del tangent  # Clean up reference

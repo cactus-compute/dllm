@@ -309,6 +309,57 @@ def cosine_schedule(
     return alpha_t, alpha_t_prime
 
 
+# ============== Expected Log Map for Sampling ==============
+
+
+def expected_logmap_to_onehots(
+    x_t: torch.Tensor, probs: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Compute E_{k~probs}[log_map(x_t, e_k)] on the unit sphere.
+
+    This is the mathematically correct way to compute the expected direction
+    toward a categorical distribution over one-hot targets. It properly accounts
+    for the nonlinearity of log_map on the sphere.
+
+    The standard approach log_map(x_t, sqrt(probs)) is an approximation that
+    can introduce systematic bias when probs is not sharply peaked.
+
+    Mathematical derivation:
+    For one-hot e_k, log_map(x_t, e_k) = arccos(x_t[k]) / sqrt(1 - x_t[k]^2) * (e_k - x_t[k] * x_t)
+    Taking expectation over k weighted by probs[k]:
+    E[log_map] = sum_k probs[k] * c_k * e_k - (sum_k probs[k] * c_k * x_t[k]) * x_t
+               = u - <u, x_t> * x_t
+    where c_k = arccos(x_t[k]) / sqrt(1 - x_t[k]^2) and u = probs * c (elementwise).
+
+    Args:
+        x_t: Current point on sphere, shape (..., V), assumed unit norm in positive orthant
+        probs: Softmax distribution over vocab, shape (..., V)
+        eps: Small constant for numerical stability
+
+    Returns:
+        Tangent vector at x_t, shape (..., V)
+    """
+    # Clamp x_t to avoid numerical issues at boundaries
+    x = x_t.clamp(min=eps, max=1 - eps)
+
+    # c_k = arccos(x_k) / sqrt(1 - x_k^2)
+    # This is the coefficient for each one-hot direction
+    denom = (1.0 - x * x).clamp_min(eps).sqrt()
+    c = torch.arccos(x) / denom
+
+    # u = sum_k p_k * c_k * e_k (elementwise: probs * c)
+    u = probs * c
+
+    # Scalar s = <u, x_t> = sum_k p_k * c_k * x_t[k]
+    s = (u * x_t).sum(dim=-1, keepdim=True)
+
+    # v = u - s * x_t (project to tangent space at x_t)
+    v = u - s * x_t
+
+    return v
+
+
 # ============== Memory-Efficient MSE Loss ==============
 
 
