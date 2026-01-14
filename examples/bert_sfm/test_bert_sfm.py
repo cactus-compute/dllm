@@ -310,4 +310,64 @@ for steps in [20, 50]:
 
 print("Training without time embedding test PASSED!")
 
+# Test RK2 integrator
+print("\n=== Testing RK2 Integrator ===")
+model.eval()
+sampler_rk2 = BertSFMSampler(model=model, tokenizer=tokenizer)
+
+print(f"Input: {test_text}")
+
+# Test both Euler and RK2 integrators
+for integrator in ["euler", "rk2"]:
+    for steps in [20, 40]:
+        config = BertSFMSamplerConfig(
+            steps=steps,
+            temperature=0.0,
+            prediction_type="endpoint",
+            integrator_type=integrator,
+        )
+        output = sampler_rk2.infill([inputs["input_ids"][0]], config=config, time_embedding=time_embedding_ce)
+        output_ids = output.sequences[0] if hasattr(output, "sequences") else output[0]
+        output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+        print(f"{integrator:5s} steps={steps:2d}: {output_text}")
+
+print("RK2 integrator test PASSED!")
+
+# Test RK2 with evaluation (prediction_step uses integrator_type from trainer config)
+print("\n=== Testing RK2 in Evaluation ===")
+model_rk2_eval = transformers.AutoModelForMaskedLM.from_pretrained(model_name)
+
+args_rk2 = BertSFMTrainer.BertSFMConfig(
+    output_dir="/tmp/test_bert_sfm_rk2",
+    per_device_train_batch_size=20,
+    num_train_epochs=5,
+    learning_rate=5e-3,
+    logging_steps=5,
+    save_strategy="no",
+    report_to="none",
+    eval_strategy="epoch",
+    use_cpu=True,
+    dataloader_num_workers=0,
+    loss_type="ce",
+    eval_integrator_type="rk2",  # Use RK2 for evaluation
+    eval_integration_steps=20,
+)
+
+trainer_rk2 = BertSFMTrainer(
+    model=model_rk2_eval,
+    args=args_rk2,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    eval_dataset=eval_dataset,
+    data_collator=transformers.DataCollatorForSeq2Seq(
+        tokenizer, return_tensors="pt", padding=True
+    ),
+)
+
+result_rk2 = trainer_rk2.train()
+print(f"Final loss with RK2 eval: {result_rk2.training_loss:.4f}")
+eval_metrics_rk2 = trainer_rk2.evaluate()
+print(f"RK2 eval metrics: {eval_metrics_rk2}")
+print("RK2 evaluation test PASSED!")
+
 print("\n=== Test Complete ===")

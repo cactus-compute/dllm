@@ -31,7 +31,7 @@ GRID = {
     "loss_type": ["ce", "mse"],
     "schedule_type": ["linear", "cosine"],
     "loss_weight_type": ["uniform", "time_weighted"],
-    "eval_step_weight_cap": [0.0],
+    "eval_step_weight_cap": [0.0, 4.0],
 }
 
 # Integrator configurations: (integrator_type, steps)
