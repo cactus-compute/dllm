@@ -51,10 +51,11 @@ class BertSFMSamplerConfig(SamplerConfig):
     # Set to 0 to disable capping, otherwise caps step_weight at this multiple of dt
     step_weight_cap: float = 0.0  # 0 = no cap, e.g. 4.0 = cap at 4x dt
     # Use expected_logmap_to_onehots instead of log_map(x_t, sqrt(probs))
-    # This is mathematically more correct for computing the expected direction
+    # This is mathematically correct for computing the expected direction
     # toward a categorical distribution, accounting for log_map nonlinearity.
-    # May reduce error accumulation during integration when predictions are uncertain.
-    use_expected_logmap: bool = False
+    # Significantly more stable and accurate than the legacy sqrt(probs) approach.
+    # Default: True (recommended). Set to False only for legacy compatibility.
+    use_expected_logmap: bool = True
 
 
 # ============== Sampler ==============
@@ -211,8 +212,9 @@ class BertSFMSampler(BaseSampler):
                     tangent.mul_(step_weight)
                     del probs
                 else:
-                    # Standard approach: log_map(x_t, sqrt(probs))
-                    # x_1_pred = sqrt(probs), in-place sqrt
+                    # DEPRECATED: Legacy approach using log_map(x_t, sqrt(probs))
+                    # This approximation introduces systematic bias when probs is not sharply peaked.
+                    # Use use_expected_logmap=True (default) for better stability and accuracy.
                     x_1_pred = probs.sqrt_()
                     del probs  # Clean up reference (x_1_pred holds the data)
                     # log_map_inplace stores result in x_1_pred (now becomes tangent)

@@ -101,8 +101,9 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     # Use expected_logmap_to_onehots instead of log_map(x_t, sqrt(probs))
     # This computes the mathematically correct expected direction toward a categorical
     # distribution, accounting for the nonlinearity of log_map on the sphere.
-    # May reduce error accumulation during integration when predictions are uncertain.
-    use_expected_logmap: bool = False
+    # Significantly more stable and accurate than the legacy sqrt(probs) approach.
+    # Default: True (recommended). Set to False only for legacy compatibility.
+    use_expected_logmap: bool = True
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
@@ -369,14 +370,15 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                     probs = F.softmax(logits, dim=-1)
 
                     # Check if we should use expected_logmap_to_onehots
-                    use_expected_logmap = getattr(self.args, 'use_expected_logmap', False)
+                    use_expected_logmap = getattr(self.args, 'use_expected_logmap', True)
                     if use_expected_logmap:
                         # Use expected_logmap_to_onehots: mathematically correct expected direction
                         tangent = expected_logmap_to_onehots(x_sphere, probs) * step_weight
                     else:
-                        # Standard approach: log_map(x_t, sqrt(probs))
+                        # DEPRECATED: Legacy approach using log_map(x_t, sqrt(probs))
+                        # This approximation introduces systematic bias when probs is not sharply peaked.
+                        # Use use_expected_logmap=True (default) for better stability and accuracy.
                         x_1_pred = probs.sqrt()
-                        # Log map for geodesic step
                         dot_pq = (x_sphere * x_1_pred).sum(dim=-1, keepdim=True)
                         q_proj = x_1_pred - dot_pq * x_sphere
                         q_proj_norm = torch.norm(q_proj, dim=-1, keepdim=True).clamp(min=1e-8)
