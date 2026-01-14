@@ -173,19 +173,20 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             max_entropy = math.log(unwrapped_model.config.vocab_size)
 
             # Build log dict
+            # Note: Use eval_ prefix (not eval/) so wandb's rewrite_logs converts to eval/
             all_logs = {}
             for i in range(10):
-                all_logs[f"eval/loss_t_{i*10}-{(i+1)*10}pct"] = avg_bucket_losses[i]
+                all_logs[f"eval_loss_t_{i*10}-{(i+1)*10}pct"] = avg_bucket_losses[i]
             for i in range(steps):
-                all_logs[f"eval/step_{i}_loss"] = avg_step_losses[i]
-                all_logs[f"eval/step_{i}_geodist"] = avg_step_distances[i]
-                all_logs[f"eval/step_{i}_tv"] = avg_step_tvs[i]
-                all_logs[f"eval/step_{i}_entropy"] = avg_step_entropies[i]
-                all_logs[f"eval/step_{i}_entropy_pct"] = 100.0 * avg_step_entropies[i] / max_entropy
-            all_logs["eval/final_loss"] = avg_final_loss
-            all_logs["eval/mean_step_tv"] = sum(avg_step_tvs) / len(avg_step_tvs) if avg_step_tvs else 0.0
-            all_logs["eval/mean_step_entropy"] = sum(avg_step_entropies) / len(avg_step_entropies) if avg_step_entropies else 0.0
-            all_logs["eval/mean_step_entropy_pct"] = 100.0 * all_logs["eval/mean_step_entropy"] / max_entropy
+                all_logs[f"eval_step_{i}_loss"] = avg_step_losses[i]
+                all_logs[f"eval_step_{i}_geodist"] = avg_step_distances[i]
+                all_logs[f"eval_step_{i}_tv"] = avg_step_tvs[i]
+                all_logs[f"eval_step_{i}_entropy"] = avg_step_entropies[i]
+                all_logs[f"eval_step_{i}_entropy_pct"] = 100.0 * avg_step_entropies[i] / max_entropy
+            all_logs["eval_final_loss"] = avg_final_loss
+            all_logs["eval_mean_step_tv"] = sum(avg_step_tvs) / len(avg_step_tvs) if avg_step_tvs else 0.0
+            all_logs["eval_mean_step_entropy"] = sum(avg_step_entropies) / len(avg_step_entropies) if avg_step_entropies else 0.0
+            all_logs["eval_mean_step_entropy_pct"] = 100.0 * all_logs["eval_mean_step_entropy"] / max_entropy
 
             # Log once per evaluation
             self.log(all_logs)
