@@ -24,13 +24,22 @@ from pathlib import Path
 
 
 # Grid search parameters
+# Total: 2 * 2 * 2 * 2 * 2 * 2 = 64 runs
 GRID = {
-    "learning_rate": [1e-4, 5e-5, 1e-5],
+    "learning_rate": [1e-4],
     "embed_type": ["spherical", "simplex"],
     "loss_type": ["ce", "mse"],
     "schedule_type": ["linear", "cosine"],
     "loss_weight_type": ["uniform", "time_weighted"],
+    "eval_step_weight_cap": [0.0],
 }
+
+# Integrator configurations: (integrator_type, steps)
+# euler@40 and rk2@20 have similar compute cost (rk2 does 2 forward passes per step)
+INTEGRATOR_CONFIGS = [
+    ("euler", 40),
+    ("rk2", 20),
+]
 
 # Fixed parameters
 FIXED_PARAMS = {
@@ -51,7 +60,9 @@ OUTPUT_BASE = "models/ablations/grid_search"
 def get_run_name(params: dict) -> str:
     """Generate a short run name from parameters."""
     lr_str = f"lr{params['learning_rate']:.0e}".replace("-0", "-")
-    return f"{params['embed_type']}_{params['loss_type']}_{params['schedule_type']}_{params['loss_weight_type']}_{lr_str}"
+    cap_str = f"cap{params['eval_step_weight_cap']}" if params['eval_step_weight_cap'] > 0 else "nocap"
+    integrator_str = f"{params['eval_integrator_type']}{params['eval_integration_steps']}"
+    return f"{params['embed_type']}_{params['loss_type']}_{params['schedule_type']}_{params['loss_weight_type']}_{cap_str}_{integrator_str}_{lr_str}"
 
 
 def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -> dict:
@@ -73,6 +84,9 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
         "--loss_type", params["loss_type"],
         "--schedule_type", params["schedule_type"],
         "--loss_weight_type", params["loss_weight_type"],
+        "--eval_step_weight_cap", str(params["eval_step_weight_cap"]),
+        "--eval_integration_steps", str(params["eval_integration_steps"]),
+        "--eval_integrator_type", params["eval_integrator_type"],
         "--output_dir", output_dir,
     ]
 
@@ -155,12 +169,16 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
 
 
 def main():
-    # Generate all parameter combinations
+    # Generate all parameter combinations (GRID x INTEGRATOR_CONFIGS)
     keys = list(GRID.keys())
     values = list(GRID.values())
-    combinations = list(itertools.product(*values))
-    total_runs = len(combinations)
+    grid_combinations = list(itertools.product(*values))
 
+    # Total = grid combinations * integrator configs
+    total_runs = len(grid_combinations) * len(INTEGRATOR_CONFIGS)
+
+    print(f"Grid combinations: {len(grid_combinations)}")
+    print(f"Integrator configs: {len(INTEGRATOR_CONFIGS)}")
     print(f"Total combinations: {total_runs}")
     print(f"Estimated time: ~{total_runs * 3} minutes (~{total_runs * 3 / 60:.1f} hours)")
 
@@ -175,6 +193,9 @@ def main():
         "loss_type",
         "schedule_type",
         "loss_weight_type",
+        "eval_step_weight_cap",
+        "eval_integrator_type",
+        "eval_integration_steps",
         "best_eval_loss",
         "best_step",
         "train_nll",
@@ -187,18 +208,24 @@ def main():
         writer.writeheader()
 
     # Run all combinations
-    for idx, combo in enumerate(combinations, 1):
-        params = dict(zip(keys, combo))
-        run_name = get_run_name(params)
-        output_dir = os.path.join(OUTPUT_BASE, run_name)
+    idx = 0
+    for combo in grid_combinations:
+        for integrator_type, integration_steps in INTEGRATOR_CONFIGS:
+            idx += 1
+            params = dict(zip(keys, combo))
+            params["eval_integrator_type"] = integrator_type
+            params["eval_integration_steps"] = integration_steps
 
-        metrics = run_training(params, output_dir, idx, total_runs)
+            run_name = get_run_name(params)
+            output_dir = os.path.join(OUTPUT_BASE, run_name)
 
-        row = {
-            "run_name": run_name,
-            **params,
-            **metrics,
-        }
+            metrics = run_training(params, output_dir, idx, total_runs)
+
+            row = {
+                "run_name": run_name,
+                **params,
+                **metrics,
+            }
 
         # Append to CSV immediately
         with open(csv_path, "a", newline="") as f:

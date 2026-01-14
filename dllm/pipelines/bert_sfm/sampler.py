@@ -56,6 +56,10 @@ class BertSFMSamplerConfig(SamplerConfig):
     # Significantly more stable and accurate than the legacy sqrt(probs) approach.
     # Default: True (recommended). Set to False only for legacy compatibility.
     use_expected_logmap: bool = True
+    # Integrator type for flow integration
+    # "euler" = standard Euler method (1 forward pass per step)
+    # "rk2" = Midpoint method / RK2 (2 forward passes per step, more accurate)
+    integrator_type: str = "euler"
 
 
 # ============== Sampler ==============
@@ -87,6 +91,93 @@ class BertSFMSampler(BaseSampler):
         else:
             raise ValueError(f"Unknown schedule_type: {config.schedule_type}")
 
+    def _compute_tangent(
+        self,
+        x_sphere: torch.Tensor,
+        flow_mask: torch.Tensor,
+        context_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        config: BertSFMSamplerConfig,
+        t: torch.Tensor,
+        temperature: float,
+        embed_layer,
+        time_embedding: TimeEmbedding | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute the tangent vector (velocity) at the current sphere state.
+
+        This is the core computation shared by all integrators: given x_sphere at time t,
+        run the model and compute the tangent direction toward the predicted endpoint.
+
+        Args:
+            x_sphere: Current sphere state, shape (B, T, V).
+            flow_mask: Boolean mask for flow positions (B, T).
+            context_embeds: Discrete embeddings for context positions (B, T, D).
+            attention_mask: Attention mask for the model (B, T).
+            config: Sampler configuration.
+            t: Current time, scalar tensor.
+            temperature: Temperature for logits.
+            embed_layer: Model's embedding layer.
+            time_embedding: Optional time embedding module.
+
+        Returns:
+            Tangent vector (unnormalized velocity), shape (B, T, V).
+        """
+        # Compute soft embeddings from current sphere state
+        x_embed = x_sphere if config.embed_type == "spherical" else sphere_to_simplex(x_sphere)
+        soft_embeddings = torch.matmul(
+            x_embed.to(embed_layer.weight.dtype), embed_layer.weight
+        )
+        if x_embed is not x_sphere:
+            del x_embed
+
+        # Use discrete embeddings for context positions
+        soft_embeddings[~flow_mask] = context_embeds[~flow_mask]
+
+        # Add time embedding if provided
+        if time_embedding is not None:
+            batch_size = x_sphere.shape[0]
+            t_batch = t.expand(batch_size)
+            time_emb = time_embedding(t_batch)
+            soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
+
+        # Model forward pass
+        outputs = self.model(
+            inputs_embeds=soft_embeddings,
+            attention_mask=attention_mask,
+        )
+        del soft_embeddings
+        logits = outputs.logits
+        del outputs
+
+        # Apply temperature
+        if temperature > 0:
+            logits.div_(temperature)
+
+        # Compute tangent based on prediction type
+        prediction_type = getattr(config, "prediction_type", "endpoint")
+
+        if prediction_type == "endpoint":
+            probs = F.softmax(logits, dim=-1)
+            del logits
+
+            use_expected_logmap = getattr(config, "use_expected_logmap", True)
+            if use_expected_logmap:
+                tangent = expected_logmap_to_onehots(x_sphere, probs)
+                del probs
+            else:
+                x_1_pred = probs.sqrt_()
+                del probs
+                tangent = log_map_inplace(x_sphere, x_1_pred)
+
+        elif prediction_type == "velocity":
+            tangent = make_tangent(x_sphere, logits)
+            del logits
+        else:
+            raise ValueError(f"Unknown prediction_type: {prediction_type}")
+
+        return tangent
+
     @torch.no_grad()
     def flow_integrate(
         self,
@@ -106,8 +197,9 @@ class BertSFMSampler(BaseSampler):
 
         Integrates from t=0 to t=1, updating only positions where flow_mask=True.
 
-        This implementation is memory-optimized to minimize peak memory usage
-        by using in-place operations and explicitly deleting intermediate tensors.
+        Supports multiple integrators:
+        - "euler": Standard Euler method (1 forward pass per step)
+        - "rk2": Midpoint method (2 forward passes per step, more accurate)
 
         Args:
             x_sphere: Initial sphere state, shape (B, T, V). Positions where
@@ -142,106 +234,95 @@ class BertSFMSampler(BaseSampler):
             init_tokens = sphere_to_simplex(x_sphere).argmax(dim=-1)
             histories.append(init_tokens.clone())
 
+        integrator_type = getattr(config, "integrator_type", "euler")
+        prediction_type = getattr(config, "prediction_type", "endpoint")
+        step_weight_cap = getattr(config, "step_weight_cap", 0.0)
+
         # Integration loop
         for step_idx in range(steps):
             t_curr = timesteps[step_idx]
             t_next = timesteps[step_idx + 1]
             dt = t_next - t_curr
 
-            # Get schedule values
-            alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
+            if integrator_type == "euler":
+                # Standard Euler: x_{n+1} = exp(x_n, tangent * step_weight)
+                alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
 
-            # Compute soft embeddings from current sphere state
-            x_embed = x_sphere if config.embed_type == "spherical" else sphere_to_simplex(x_sphere)
-            soft_embeddings = torch.matmul(
-                x_embed.to(embed_layer.weight.dtype), embed_layer.weight
-            )
-            if x_embed is not x_sphere:
-                del x_embed  # Free simplex conversion if created
+                tangent = self._compute_tangent(
+                    x_sphere, flow_mask, context_embeds, attention_mask,
+                    config, t_curr, temperature, embed_layer, time_embedding
+                )
 
-            # Use discrete embeddings for context, soft embeddings for flow positions (in-place)
-            soft_embeddings[~flow_mask] = context_embeds[~flow_mask]
-
-            # Add time embedding if provided
-            if time_embedding is not None:
-                # t_curr is scalar, expand to batch size
-                batch_size = x_sphere.shape[0]
-                t_batch = t_curr.expand(batch_size)  # (B,)
-                time_emb = time_embedding(t_batch)  # (B, hidden_size)
-                # Ensure dtype matches soft_embeddings (important for mixed precision)
-                soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
-
-            # Model forward pass
-            outputs = self.model(
-                inputs_embeds=soft_embeddings,
-                attention_mask=attention_mask,
-            )
-            del soft_embeddings  # Free embedding memory immediately
-            logits = outputs.logits  # (B, T, V)
-            del outputs  # Free model output container
-
-            # Apply temperature
-            if temperature > 0:
-                logits.div_(temperature)  # In-place division
-
-            # Compute step based on prediction type
-            prediction_type = getattr(config, "prediction_type", "endpoint")
-
-            if prediction_type == "endpoint":
-                # Endpoint prediction: logits -> probabilities -> sphere point
-                # Softmax then sqrt to get sphere point
-                probs = F.softmax(logits, dim=-1)
-                del logits
-
-                # Compute step weight: alpha'(t) * dt / (1 - alpha(t))
-                step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5)) * inference_scaling
-
-                # Optionally cap step weight to prevent blow-up near t=1
-                # This trades off some accuracy for stability when model predictions are imperfect
-                step_weight_cap = getattr(config, "step_weight_cap", 0.0)
-                if step_weight_cap > 0:
-                    max_weight = step_weight_cap * dt
-                    step_weight = min(step_weight, max_weight)
-
-                # Compute tangent vector toward predicted endpoint
-                use_expected_logmap = getattr(config, "use_expected_logmap", False)
-                if use_expected_logmap:
-                    # Use expected_logmap_to_onehots: mathematically correct expected direction
-                    # that accounts for log_map nonlinearity over the categorical distribution
-                    tangent = expected_logmap_to_onehots(x_sphere, probs)
+                if prediction_type == "endpoint":
+                    step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5)) * inference_scaling
+                    if step_weight_cap > 0:
+                        step_weight = min(step_weight, step_weight_cap * dt)
                     tangent.mul_(step_weight)
-                    del probs
                 else:
-                    # DEPRECATED: Legacy approach using log_map(x_t, sqrt(probs))
-                    # This approximation introduces systematic bias when probs is not sharply peaked.
-                    # Use use_expected_logmap=True (default) for better stability and accuracy.
-                    x_1_pred = probs.sqrt_()
-                    del probs  # Clean up reference (x_1_pred holds the data)
-                    # log_map_inplace stores result in x_1_pred (now becomes tangent)
-                    tangent = log_map_inplace(x_sphere, x_1_pred)
-                    tangent.mul_(step_weight)
+                    tangent.mul_(dt * inference_scaling)
 
-                # exp_map_inplace stores result in tangent (now becomes x_sphere_new)
                 x_sphere_new = exp_map_inplace(x_sphere, tangent)
-                del tangent  # Clean up reference
+                del tangent
 
-            elif prediction_type == "velocity":
-                # Velocity prediction: logits are raw velocity, project to tangent space
-                velocity = make_tangent(x_sphere, logits)
-                del logits
+            elif integrator_type == "rk2":
+                # RK2 / Midpoint method:
+                # 1. Compute k1 = tangent at (x_n, t_n)
+                # 2. Take half step: x_mid = exp(x_n, k1 * step_weight/2)
+                # 3. Compute k2 = tangent at (x_mid, t_n + dt/2)
+                # 4. Take full step from x_n using k2: x_{n+1} = exp(x_n, k2 * step_weight)
 
-                # Scale velocity in-place
-                velocity.mul_(dt * inference_scaling)
-                # exp_map_inplace stores result in velocity
-                x_sphere_new = exp_map_inplace(x_sphere, velocity)
-                del velocity
+                # Step 1: Compute k1 at current point
+                alpha_t, alpha_t_prime = self._get_schedule(t_curr.unsqueeze(0), config)
+
+                k1 = self._compute_tangent(
+                    x_sphere, flow_mask, context_embeds, attention_mask,
+                    config, t_curr, temperature, embed_layer, time_embedding
+                )
+
+                if prediction_type == "endpoint":
+                    step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5)) * inference_scaling
+                    if step_weight_cap > 0:
+                        step_weight = min(step_weight, step_weight_cap * dt)
+                else:
+                    step_weight = dt * inference_scaling
+
+                # Step 2: Take half step to get midpoint
+                k1_half = k1.mul(step_weight * 0.5)
+                del k1
+                x_mid = exp_map(x_sphere, k1_half)
+                del k1_half
+                x_mid.div_(torch.norm(x_mid, dim=-1, keepdim=True).clamp(min=1e-8))
+
+                # Step 3: Compute k2 at midpoint (at time t + dt/2)
+                t_mid = t_curr + dt * 0.5
+                alpha_t_mid, alpha_t_prime_mid = self._get_schedule(t_mid.unsqueeze(0), config)
+
+                k2 = self._compute_tangent(
+                    x_mid, flow_mask, context_embeds, attention_mask,
+                    config, t_mid, temperature, embed_layer, time_embedding
+                )
+                del x_mid
+
+                # Recompute step weight at midpoint for endpoint prediction
+                if prediction_type == "endpoint":
+                    step_weight_mid = (alpha_t_prime_mid * dt / (1 - alpha_t_mid + 1e-5)) * inference_scaling
+                    if step_weight_cap > 0:
+                        step_weight_mid = min(step_weight_mid, step_weight_cap * dt)
+                    k2.mul_(step_weight_mid)
+                else:
+                    k2.mul_(dt * inference_scaling)
+
+                # Step 4: Take full step from x_n using k2
+                x_sphere_new = exp_map_inplace(x_sphere, k2)
+                del k2
+
             else:
-                raise ValueError(f"Unknown prediction_type: {prediction_type}")
+                raise ValueError(f"Unknown integrator_type: {integrator_type}")
 
-            # Project to sphere in-place
+            # Project to sphere
             x_sphere_new.div_(torch.norm(x_sphere_new, dim=-1, keepdim=True).clamp(min=1e-8))
 
-            # Only update flow positions; keep context positions fixed (in-place)
+            # Only update flow positions; keep context positions fixed
             x_sphere[flow_mask] = x_sphere_new[flow_mask]
             del x_sphere_new
 

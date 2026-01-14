@@ -129,6 +129,7 @@ class BertSFMTrainer(transformers.Trainer):
         embed_type: str = "spherical"  # "spherical" or "simplex"
         loss_type: str = "ce"  # "ce" (cross-entropy) or "mse" (velocity MSE)
         eval_integration_steps: int = 20  # Number of integration steps for evaluation
+        eval_integrator_type: str = "euler"  # "euler" or "rk2" for evaluation
         weight_decay: float = 0.1  # AdamW weight decay (L2 regularization)
         # Dataloader optimizations - defaults set based on CUDA availability
         dataloader_num_workers: int = 8 if torch.cuda.is_available() else 0
@@ -190,6 +191,7 @@ class BertSFMTrainer(transformers.Trainer):
         self.embed_type = args.embed_type
         self.loss_type = args.loss_type
         self.eval_integration_steps = args.eval_integration_steps
+        self.eval_integrator_type = args.eval_integrator_type
         # Self-consistency training
         self.self_consistency_prob = args.self_consistency_prob
         self.self_consistency_max_steps = args.self_consistency_max_steps
@@ -461,6 +463,7 @@ class BertSFMTrainer(transformers.Trainer):
             schedule_nu=self.schedule_nu,
             embed_type=self.embed_type,
             step_weight_cap=self.eval_step_weight_cap,
+            integrator_type=self.eval_integrator_type,
         )
 
         # Run flow integration (reuses the core loop)
