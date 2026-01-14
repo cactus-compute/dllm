@@ -119,6 +119,8 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         self._diag_step_entropies = [[] for _ in range(steps)]  # Entropy per step
         self._diag_final_losses = []
         self._diag_batch_count = 0
+        # Local contraction test accumulators (per step)
+        self._diag_contraction_ratios = [[] for _ in range(steps)]
 
     def evaluation_loop(self, dataloader, description, prediction_loss_only=None, ignore_keys=None, metric_key_prefix="eval"):
         """Override to aggregate diagnostic metrics across batches and log once."""
@@ -163,6 +165,13 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 for i in range(steps)
             ]
 
+            # Average contraction ratios
+            avg_contraction_ratios = [
+                sum(self._diag_contraction_ratios[i]) / len(self._diag_contraction_ratios[i])
+                if self._diag_contraction_ratios[i] else 0.0
+                for i in range(steps)
+            ]
+
             # Average final loss
             avg_final_loss = (
                 sum(self._diag_final_losses) / len(self._diag_final_losses)
@@ -188,6 +197,10 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             all_logs["eval_mean_step_tv"] = sum(avg_step_tvs) / len(avg_step_tvs) if avg_step_tvs else 0.0
             all_logs["eval_mean_step_entropy"] = sum(avg_step_entropies) / len(avg_step_entropies) if avg_step_entropies else 0.0
             all_logs["eval_mean_step_entropy_pct"] = 100.0 * all_logs["eval_mean_step_entropy"] / max_entropy
+            # Log contraction ratios per step
+            for i in range(steps):
+                all_logs[f"eval_step_{i}_contraction"] = avg_contraction_ratios[i]
+            all_logs["eval_mean_contraction"] = sum(avg_contraction_ratios) / len(avg_contraction_ratios) if avg_contraction_ratios else 0.0
 
             # Log once per evaluation
             self.log(all_logs)
@@ -213,6 +226,16 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             print(f"Mean step TV: {sum(avg_step_tvs) / len(avg_step_tvs):.4f}")
             mean_entropy_pct = 100.0 * sum(avg_step_entropies) / len(avg_step_entropies) / max_entropy if avg_step_entropies else 0.0
             print(f"Mean step entropy: {mean_entropy_pct:.1f}% of max (low = confident, high = uncertain)")
+            mean_contraction = sum(avg_contraction_ratios) / len(avg_contraction_ratios) if avg_contraction_ratios else 0.0
+            print(f"\nLocal contraction test (rho = d(Phi(x'), Phi(x)) / d(x', x)):")
+            print(f"  Mean contraction ratio: {mean_contraction:.4f}")
+            if mean_contraction < 1.0:
+                print(f"  -> Locally CONTRACTIVE (rho < 1): multi-step should help")
+            else:
+                print(f"  -> Locally EXPANSIVE (rho > 1): multi-step may diverge")
+            print(f"  Per-step contraction ratios:")
+            for i in range(0, steps, 4):
+                print(f"    step {i}: rho={avg_contraction_ratios[i]:.4f}")
             print("=" * 50)
 
         return output
@@ -298,9 +321,29 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         step_distances = []
         step_tvs = []
         step_entropies = []
+        step_contractions = []
 
         # Pre-expand flow_mask
         flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_sphere)
+
+        # ============================================================
+        # DIAGNOSTIC 4: Local contraction test setup
+        # Create a perturbed version of x_sphere to test if sampler is contractive
+        # x' = exp_x(epsilon * r) where r is a random tangent vector
+        # ============================================================
+        epsilon = 0.01  # Small perturbation magnitude
+        # Generate random tangent vector at x_sphere
+        random_vec = torch.randn_like(x_sphere)
+        # Project to tangent space: r = v - <v, x> * x
+        dot_xr = (x_sphere * random_vec).sum(dim=-1, keepdim=True)
+        tangent_r = random_vec - dot_xr * x_sphere
+        # Normalize and scale by epsilon
+        tangent_r = tangent_r / torch.norm(tangent_r, dim=-1, keepdim=True).clamp(min=1e-8) * epsilon
+        # Apply exp_map to get perturbed point x'
+        x_sphere_perturbed = exp_map(x_sphere, tangent_r)
+        # Compute initial distance d(x, x') for normalization
+        dot_xx_prime = (x_sphere * x_sphere_perturbed).sum(dim=-1)
+        initial_dist = torch.acos(dot_xx_prime.clamp(-1 + 1e-7, 1 - 1e-7))  # [b, l]
 
         for step_idx in range(steps):
             t_curr = timesteps[step_idx]
@@ -419,12 +462,76 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 mean_entropy = (entropy_per_pos * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_entropies.append(mean_entropy.item())
 
-        # Accumulate step losses, distances, TVs, and entropies (don't log per-batch)
+                # ============================================================
+                # DIAGNOSTIC 4: Local contraction test
+                # Run the same step on the perturbed x_sphere_perturbed and measure
+                # rho = d(Phi(x), Phi(x')) / d(x, x')
+                # If rho < 1 -> locally contractive (multi-step helps)
+                # If rho > 1 -> locally expansive (multi-step may diverge)
+                # ============================================================
+                # Compute soft embeddings for perturbed state
+                x_embed_p = x_sphere_perturbed if self.embed_type == "spherical" else sphere_to_simplex(x_sphere_perturbed)
+                soft_embeddings_p = torch.matmul(x_embed_p.to(embed_layer.weight.dtype), embed_layer.weight)
+                soft_embeddings_p = torch.where(
+                    loss_mask.unsqueeze(-1).expand_as(soft_embeddings_p),
+                    soft_embeddings_p,
+                    context_embeds,
+                )
+
+                # Forward pass on perturbed state
+                outputs_p = model(inputs_embeds=soft_embeddings_p, attention_mask=attention_mask)
+                logits_p = outputs_p.logits
+
+                # Apply same temperature
+                if eval_temp > 0:
+                    logits_p = logits_p / eval_temp
+
+                # Take integration step on perturbed state (same as main state)
+                if self.loss_type == "mse":
+                    velocity_p = make_tangent(x_sphere_perturbed, logits_p)
+                    tangent_p = velocity_p * dt
+                else:
+                    probs_p = F.softmax(logits_p, dim=-1)
+                    if use_expected_logmap:
+                        tangent_p = expected_logmap_to_onehots(x_sphere_perturbed, probs_p) * step_weight
+                    else:
+                        x_1_pred_p = probs_p.sqrt()
+                        dot_pq_p = (x_sphere_perturbed * x_1_pred_p).sum(dim=-1, keepdim=True)
+                        q_proj_p = x_1_pred_p - dot_pq_p * x_sphere_perturbed
+                        q_proj_norm_p = torch.norm(q_proj_p, dim=-1, keepdim=True).clamp(min=1e-8)
+                        dot_clamped_p = dot_pq_p.clamp(-1 + 1e-7, 1 - 1e-7)
+                        dist_p = torch.acos(dot_clamped_p)
+                        tangent_p = q_proj_p / q_proj_norm_p * dist_p * step_weight
+
+                # Apply exp_map to get new perturbed position
+                v_norm_p = torch.norm(tangent_p, dim=-1, keepdim=True).clamp(min=1e-8)
+                x_sphere_perturbed_new = x_sphere_perturbed * torch.cos(v_norm_p) + tangent_p * torch.sin(v_norm_p) / v_norm_p
+                x_sphere_perturbed_new = x_sphere_perturbed_new / torch.norm(x_sphere_perturbed_new, dim=-1, keepdim=True).clamp(min=1e-8)
+
+                # Update only flow positions for perturbed state
+                x_sphere_perturbed = torch.where(flow_mask_expanded, x_sphere_perturbed_new, x_sphere_perturbed)
+
+                # Compute distance after step: d(Phi(x), Phi(x'))
+                dot_after = (x_sphere * x_sphere_perturbed).sum(dim=-1)
+                dist_after = torch.acos(dot_after.clamp(-1 + 1e-7, 1 - 1e-7))  # [b, l]
+
+                # Compute contraction ratio rho = d_after / d_before
+                # Use initial_dist (before any steps) as d_before to avoid division issues
+                # For per-step ratio, we should track d_before at each step
+                contraction_ratio = dist_after / initial_dist.clamp(min=1e-8)
+                mean_contraction = (contraction_ratio * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                step_contractions.append(mean_contraction.item())
+
+                # Update initial_dist for next step (so we measure per-step contraction)
+                initial_dist = dist_after
+
+        # Accumulate step losses, distances, TVs, entropies, and contraction ratios (don't log per-batch)
         for i in range(steps):
             self._diag_step_losses[i].append(step_losses[i])
             self._diag_step_distances[i].append(step_distances[i])
             self._diag_step_tvs[i].append(step_tvs[i])
             self._diag_step_entropies[i].append(step_entropies[i])
+            self._diag_contraction_ratios[i].append(step_contractions[i])
 
         # Final eval (standard)
         final_probs = sphere_to_simplex(x_sphere)
