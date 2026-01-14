@@ -57,6 +57,7 @@ args_ce = BertSFMTrainer.BertSFMConfig(
     eval_strategy="no",
     use_cpu=True,
     dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
     loss_type="ce",
 )
 
@@ -96,6 +97,7 @@ args_mse = BertSFMTrainer.BertSFMConfig(
     eval_strategy="no",
     use_cpu=True,
     dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
     loss_type="mse",
 )
 
@@ -203,6 +205,7 @@ args_sc = BertSFMTrainer.BertSFMConfig(
     eval_strategy="no",
     use_cpu=True,
     dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
     loss_type="ce",
     # Self-consistency settings (noise mode)
     self_consistency_prob=0.5,  # 50% of batches use self-consistency
@@ -240,6 +243,7 @@ args_sc_ramp = BertSFMTrainer.BertSFMConfig(
     eval_strategy="no",
     use_cpu=True,
     dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
     loss_type="ce",
     # Self-consistency with linear ramp (noise mode)
     self_consistency_prob=0.5,
@@ -277,6 +281,7 @@ args_no_time = BertSFMTrainer.BertSFMConfig(
     eval_strategy="no",
     use_cpu=True,
     dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
     loss_type="ce",
     use_time_embedding=False,  # Disable time embeddings
 )
@@ -348,6 +353,7 @@ args_rk2 = BertSFMTrainer.BertSFMConfig(
     eval_strategy="epoch",
     use_cpu=True,
     dataloader_num_workers=0,
+    dataloader_prefetch_factor=None,
     loss_type="ce",
     eval_integrator_type="rk2",  # Use RK2 for evaluation
     eval_integration_steps=20,
