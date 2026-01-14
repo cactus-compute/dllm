@@ -338,6 +338,28 @@ for integrator in ["euler", "rk2"]:
 
 print("RK2 integrator test PASSED!")
 
+# Test x0_recompute integrator
+print("\n=== Testing x0_recompute Integrator ===")
+print("This integrator recomputes from x0 at each step, avoiding error accumulation.")
+
+print(f"Input: {test_text}")
+
+# Test x0_recompute integrator alongside euler for comparison
+for integrator in ["euler", "x0_recompute"]:
+    for steps in [20, 40]:
+        config = BertSFMSamplerConfig(
+            steps=steps,
+            temperature=0.0,
+            prediction_type="endpoint",
+            integrator_type=integrator,
+        )
+        output = sampler_rk2.infill([inputs["input_ids"][0]], config=config, time_embedding=time_embedding_ce)
+        output_ids = output.sequences[0] if hasattr(output, "sequences") else output[0]
+        output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+        print(f"{integrator:13s} steps={steps:2d}: {output_text}")
+
+print("x0_recompute integrator test PASSED!")
+
 # Test RK2 with evaluation (prediction_step uses integrator_type from trainer config)
 print("\n=== Testing RK2 in Evaluation ===")
 model_rk2_eval = transformers.AutoModelForMaskedLM.from_pretrained(model_name)

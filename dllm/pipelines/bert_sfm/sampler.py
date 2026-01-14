@@ -19,6 +19,7 @@ from dllm.pipelines.bert_sfm.geodesic_utils import (
     exp_map,
     exp_map_inplace,
     expected_logmap_to_onehots,
+    geodesic_interpolant,
     log_map,
     log_map_inplace,
     make_tangent,
@@ -59,6 +60,10 @@ class BertSFMSamplerConfig(SamplerConfig):
     # Integrator type for flow integration
     # "euler" = standard Euler method (1 forward pass per step)
     # "rk2" = Midpoint method / RK2 (2 forward passes per step, more accurate)
+    # "x0_recompute" = Recompute from x0 at each step instead of incremental integration
+    #   This keeps samples on geodesics from x0 to predicted x1, matching the training distribution.
+    #   Instead of x <- exp(x, w*log(x, x1_pred)), we compute x <- geodesic(x0, x1_pred, alpha(t_next))
+    #   More stable for generation as errors don't accumulate.
     integrator_type: str = "euler"
 
 
@@ -178,6 +183,83 @@ class BertSFMSampler(BaseSampler):
 
         return tangent
 
+    def _compute_x1_pred(
+        self,
+        x_sphere: torch.Tensor,
+        flow_mask: torch.Tensor,
+        context_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        config: BertSFMSamplerConfig,
+        t: torch.Tensor,
+        temperature: float,
+        embed_layer,
+        time_embedding: TimeEmbedding | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute the predicted endpoint x1 on the sphere.
+
+        This is used by the x0_recompute integrator to directly compute
+        geodesic interpolation from x0 to the predicted x1.
+
+        Args:
+            x_sphere: Current sphere state, shape (B, T, V).
+            flow_mask: Boolean mask for flow positions (B, T).
+            context_embeds: Discrete embeddings for context positions (B, T, D).
+            attention_mask: Attention mask for the model (B, T).
+            config: Sampler configuration.
+            t: Current time, scalar tensor.
+            temperature: Temperature for logits.
+            embed_layer: Model's embedding layer.
+            time_embedding: Optional time embedding module.
+
+        Returns:
+            Predicted x1 on sphere, shape (B, T, V).
+        """
+        # Compute soft embeddings from current sphere state
+        x_embed = x_sphere if config.embed_type == "spherical" else sphere_to_simplex(x_sphere)
+        soft_embeddings = torch.matmul(
+            x_embed.to(embed_layer.weight.dtype), embed_layer.weight
+        )
+        if x_embed is not x_sphere:
+            del x_embed
+
+        # Use discrete embeddings for context positions
+        soft_embeddings[~flow_mask] = context_embeds[~flow_mask]
+
+        # Add time embedding if provided
+        if time_embedding is not None:
+            batch_size = x_sphere.shape[0]
+            t_batch = t.expand(batch_size)
+            time_emb = time_embedding(t_batch)
+            soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
+
+        # Model forward pass
+        outputs = self.model(
+            inputs_embeds=soft_embeddings,
+            attention_mask=attention_mask,
+        )
+        del soft_embeddings
+        logits = outputs.logits
+        del outputs
+
+        # Apply temperature
+        if temperature > 0:
+            logits.div_(temperature)
+
+        # Convert logits to x1_pred on sphere: sqrt(softmax(logits))
+        probs = F.softmax(logits, dim=-1)
+        del logits
+
+        # Map to sphere: x1_pred = sqrt(probs)
+        # Use clamp to ensure numerical stability before sqrt
+        x1_pred = probs.clamp(min=1e-8).sqrt()
+        del probs
+
+        # Normalize to unit sphere for stability
+        x1_pred = x1_pred / torch.norm(x1_pred, dim=-1, keepdim=True).clamp(min=1e-8)
+
+        return x1_pred
+
     @torch.no_grad()
     def flow_integrate(
         self,
@@ -200,6 +282,7 @@ class BertSFMSampler(BaseSampler):
         Supports multiple integrators:
         - "euler": Standard Euler method (1 forward pass per step)
         - "rk2": Midpoint method (2 forward passes per step, more accurate)
+        - "x0_recompute": Recompute geodesic from x0 at each step (no error accumulation)
 
         Args:
             x_sphere: Initial sphere state, shape (B, T, V). Positions where
@@ -237,6 +320,12 @@ class BertSFMSampler(BaseSampler):
         integrator_type = getattr(config, "integrator_type", "euler")
         prediction_type = getattr(config, "prediction_type", "endpoint")
         step_weight_cap = getattr(config, "step_weight_cap", 0.0)
+
+        # For x0_recompute integrator, store the initial state
+        # We only need to store the flow positions since context positions are fixed
+        x0_sphere = None
+        if integrator_type == "x0_recompute":
+            x0_sphere = x_sphere.clone()
 
         # Integration loop
         for step_idx in range(steps):
@@ -315,6 +404,30 @@ class BertSFMSampler(BaseSampler):
                 # Step 4: Take full step from x_n using k2
                 x_sphere_new = exp_map_inplace(x_sphere, k2)
                 del k2
+
+            elif integrator_type == "x0_recompute":
+                # x0_recompute: Instead of incremental integration, recompute from x0 each step.
+                # This avoids error accumulation by staying on geodesics from x0 to predicted x1.
+                #
+                # At each step:
+                # 1. Predict x1 from current x_t
+                # 2. Compute x_{t+1} = geodesic(x0, x1_pred, alpha(t_next))
+                #
+                # This is the manifold analogue of the DDPM-style "x0-prediction" update.
+
+                # Get alpha at next timestep for the geodesic interpolation
+                alpha_next, _ = self._get_schedule(t_next.unsqueeze(0), config)
+
+                # Predict x1 from current state
+                x1_pred = self._compute_x1_pred(
+                    x_sphere, flow_mask, context_embeds, attention_mask,
+                    config, t_curr, temperature, embed_layer, time_embedding
+                )
+
+                # Compute x_{t+1} = geodesic(x0, x1_pred, alpha(t_next))
+                # geodesic_interpolant handles the expansion of alpha_next to match dimensions
+                x_sphere_new = geodesic_interpolant(x0_sphere, x1_pred, alpha_next)
+                del x1_pred
 
             else:
                 raise ValueError(f"Unknown integrator_type: {integrator_type}")
