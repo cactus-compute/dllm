@@ -122,6 +122,25 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         # Local contraction test accumulators (per step)
         self._diag_contraction_ratios = [[] for _ in range(steps)]
 
+        # NEW DIAGNOSTICS
+        # 1) One-step improvement test: ΔL = L_{k+1} - L_k bucketed by entropy
+        #    3 entropy buckets: low, medium, high
+        self._diag_delta_L_low_entropy = [[] for _ in range(steps)]
+        self._diag_delta_L_med_entropy = [[] for _ in range(steps)]
+        self._diag_delta_L_high_entropy = [[] for _ in range(steps)]
+
+        # 2) Directional contraction: along model's update direction (u) and GT direction (g)
+        self._diag_contraction_u = [[] for _ in range(steps)]  # Along update tangent
+        self._diag_contraction_g = [[] for _ in range(steps)]  # Along GT tangent
+
+        # 3) Support-violation / OOD distance from training manifold
+        self._diag_ood_distance = [[] for _ in range(steps)]
+
+        # 4) Calibration: accuracy and confidence for ECE computation
+        self._diag_calibration_correct = [[] for _ in range(10)]  # 10 confidence buckets
+        self._diag_calibration_confidence = [[] for _ in range(10)]
+        self._diag_calibration_count = [[] for _ in range(10)]
+
     def evaluation_loop(self, dataloader, description, prediction_loss_only=None, ignore_keys=None, metric_key_prefix="eval"):
         """Override to aggregate diagnostic metrics across batches and log once."""
         # Initialize accumulators before evaluation
@@ -172,6 +191,64 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 for i in range(steps)
             ]
 
+            # NEW: Average ΔL by entropy bucket
+            avg_delta_L_low = [
+                sum(self._diag_delta_L_low_entropy[i]) / len(self._diag_delta_L_low_entropy[i])
+                if self._diag_delta_L_low_entropy[i] else 0.0
+                for i in range(steps)
+            ]
+            avg_delta_L_med = [
+                sum(self._diag_delta_L_med_entropy[i]) / len(self._diag_delta_L_med_entropy[i])
+                if self._diag_delta_L_med_entropy[i] else 0.0
+                for i in range(steps)
+            ]
+            avg_delta_L_high = [
+                sum(self._diag_delta_L_high_entropy[i]) / len(self._diag_delta_L_high_entropy[i])
+                if self._diag_delta_L_high_entropy[i] else 0.0
+                for i in range(steps)
+            ]
+
+            # NEW: Average directional contraction ratios
+            avg_contraction_u = [
+                sum(self._diag_contraction_u[i]) / len(self._diag_contraction_u[i])
+                if self._diag_contraction_u[i] else 0.0
+                for i in range(steps)
+            ]
+            avg_contraction_g = [
+                sum(self._diag_contraction_g[i]) / len(self._diag_contraction_g[i])
+                if self._diag_contraction_g[i] else 0.0
+                for i in range(steps)
+            ]
+
+            # NEW: Average OOD distance
+            avg_ood_distance = [
+                sum(self._diag_ood_distance[i]) / len(self._diag_ood_distance[i])
+                if self._diag_ood_distance[i] else 0.0
+                for i in range(steps)
+            ]
+
+            # NEW: Compute ECE (Expected Calibration Error) from calibration buckets
+            ece = 0.0
+            total_samples = 0
+            calibration_gaps = []
+            for bucket_idx in range(10):
+                if self._diag_calibration_count[bucket_idx]:
+                    bucket_count = sum(self._diag_calibration_count[bucket_idx])
+                    if bucket_count > 0:
+                        # Weighted average of accuracy and confidence for this bucket
+                        bucket_correct = sum(
+                            c * n for c, n in zip(self._diag_calibration_correct[bucket_idx], self._diag_calibration_count[bucket_idx])
+                        ) / bucket_count
+                        bucket_conf = sum(
+                            c * n for c, n in zip(self._diag_calibration_confidence[bucket_idx], self._diag_calibration_count[bucket_idx])
+                        ) / bucket_count
+                        gap = abs(bucket_correct - bucket_conf)
+                        calibration_gaps.append((bucket_idx, bucket_correct, bucket_conf, gap, bucket_count))
+                        ece += gap * bucket_count
+                        total_samples += bucket_count
+            if total_samples > 0:
+                ece /= total_samples
+
             # Average final loss
             avg_final_loss = (
                 sum(self._diag_final_losses) / len(self._diag_final_losses)
@@ -201,6 +278,30 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             for i in range(steps):
                 all_logs[f"eval_step_{i}_contraction"] = avg_contraction_ratios[i]
             all_logs["eval_mean_contraction"] = sum(avg_contraction_ratios) / len(avg_contraction_ratios) if avg_contraction_ratios else 0.0
+
+            # NEW: Log ΔL by entropy bucket
+            for i in range(steps):
+                all_logs[f"eval_step_{i}_delta_L_low_entropy"] = avg_delta_L_low[i]
+                all_logs[f"eval_step_{i}_delta_L_med_entropy"] = avg_delta_L_med[i]
+                all_logs[f"eval_step_{i}_delta_L_high_entropy"] = avg_delta_L_high[i]
+            all_logs["eval_mean_delta_L_low_entropy"] = sum(avg_delta_L_low) / len(avg_delta_L_low) if avg_delta_L_low else 0.0
+            all_logs["eval_mean_delta_L_med_entropy"] = sum(avg_delta_L_med) / len(avg_delta_L_med) if avg_delta_L_med else 0.0
+            all_logs["eval_mean_delta_L_high_entropy"] = sum(avg_delta_L_high) / len(avg_delta_L_high) if avg_delta_L_high else 0.0
+
+            # NEW: Log directional contraction ratios
+            for i in range(steps):
+                all_logs[f"eval_step_{i}_contraction_u"] = avg_contraction_u[i]
+                all_logs[f"eval_step_{i}_contraction_g"] = avg_contraction_g[i]
+            all_logs["eval_mean_contraction_u"] = sum(avg_contraction_u) / len(avg_contraction_u) if avg_contraction_u else 0.0
+            all_logs["eval_mean_contraction_g"] = sum(avg_contraction_g) / len(avg_contraction_g) if avg_contraction_g else 0.0
+
+            # NEW: Log OOD distance
+            for i in range(steps):
+                all_logs[f"eval_step_{i}_ood_distance"] = avg_ood_distance[i]
+            all_logs["eval_mean_ood_distance"] = sum(avg_ood_distance) / len(avg_ood_distance) if avg_ood_distance else 0.0
+
+            # NEW: Log ECE (Expected Calibration Error)
+            all_logs["eval_ece"] = ece
 
             # Log once per evaluation
             self.log(all_logs)
@@ -236,6 +337,51 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             print(f"  Per-step contraction ratios:")
             for i in range(0, steps, 4):
                 print(f"    step {i}: rho={avg_contraction_ratios[i]:.4f}")
+
+            # NEW: One-step improvement test (ΔL by entropy)
+            mean_delta_L_low = sum(avg_delta_L_low) / len(avg_delta_L_low) if avg_delta_L_low else 0.0
+            mean_delta_L_med = sum(avg_delta_L_med) / len(avg_delta_L_med) if avg_delta_L_med else 0.0
+            mean_delta_L_high = sum(avg_delta_L_high) / len(avg_delta_L_high) if avg_delta_L_high else 0.0
+            print(f"\nOne-step improvement test (ΔL = L_after - L_before, by entropy bucket):")
+            print(f"  Low entropy (confident):  ΔL = {mean_delta_L_low:+.4f}")
+            print(f"  Med entropy (moderate):   ΔL = {mean_delta_L_med:+.4f}")
+            print(f"  High entropy (uncertain): ΔL = {mean_delta_L_high:+.4f}")
+            if mean_delta_L_low > 0.1 and mean_delta_L_low > mean_delta_L_high:
+                print(f"  -> WARNING: Low entropy positions have POSITIVE ΔL (confirmation bias!)")
+            print(f"  Per-step ΔL (low entropy):")
+            for i in range(0, steps, 4):
+                print(f"    step {i}: ΔL_low={avg_delta_L_low[i]:+.4f}, ΔL_med={avg_delta_L_med[i]:+.4f}, ΔL_high={avg_delta_L_high[i]:+.4f}")
+
+            # NEW: Directional contraction test
+            mean_contraction_u = sum(avg_contraction_u) / len(avg_contraction_u) if avg_contraction_u else 0.0
+            mean_contraction_g = sum(avg_contraction_g) / len(avg_contraction_g) if avg_contraction_g else 0.0
+            print(f"\nDirectional contraction test:")
+            print(f"  Along update direction (u): rho_u = {mean_contraction_u:.4f}")
+            print(f"  Along GT direction (g):     rho_g = {mean_contraction_g:.4f}")
+            if mean_contraction_u > 1.0:
+                print(f"  -> WARNING: Expansive along model's update direction (instability in own mistakes)")
+            print(f"  Per-step directional contraction:")
+            for i in range(0, steps, 4):
+                print(f"    step {i}: rho_u={avg_contraction_u[i]:.4f}, rho_g={avg_contraction_g[i]:.4f}")
+
+            # NEW: OOD distance from training manifold
+            mean_ood_dist = sum(avg_ood_distance) / len(avg_ood_distance) if avg_ood_distance else 0.0
+            print(f"\nOOD distance from training manifold (lower = closer to training distribution):")
+            print(f"  Mean OOD distance: {mean_ood_dist:.4f}")
+            print(f"  Per-step OOD distance:")
+            for i in range(0, steps, 4):
+                print(f"    step {i}: d_ood={avg_ood_distance[i]:.4f}")
+
+            # NEW: Calibration / ECE
+            print(f"\nCalibration (Expected Calibration Error):")
+            print(f"  ECE = {ece:.4f} (lower = better calibrated)")
+            if calibration_gaps:
+                print(f"  Confidence buckets (accuracy vs confidence):")
+                for bucket_idx, acc, conf, gap, count in calibration_gaps:
+                    bucket_range = f"{bucket_idx*10}-{(bucket_idx+1)*10}%"
+                    overconf = "overconfident" if conf > acc else "underconfident"
+                    print(f"    {bucket_range}: acc={acc:.3f}, conf={conf:.3f}, gap={gap:.3f} ({overconf}, n={int(count)})")
+
             print("=" * 50)
 
         return output
@@ -322,6 +468,15 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         step_tvs = []
         step_entropies = []
         step_contractions = []
+
+        # NEW DIAGNOSTIC ACCUMULATORS (per-batch)
+        step_delta_L_low = []
+        step_delta_L_med = []
+        step_delta_L_high = []
+        step_contraction_u = []
+        step_contraction_g = []
+        step_ood_distance = []
+        prev_loss = None  # For computing ΔL
 
         # Pre-expand flow_mask
         flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_sphere)
@@ -525,6 +680,192 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 # Update initial_dist for next step (so we measure per-step contraction)
                 initial_dist = dist_after
 
+                # ============================================================
+                # NEW DIAGNOSTIC 1: One-step improvement test (ΔL bucketed by entropy)
+                # Measures ΔL = L_{k+1} - L_k and buckets by model's entropy at step k
+                # If low entropy + wrong → ΔL strongly positive (catastrophic feedback)
+                # ============================================================
+                # We already have step_ce (CE loss at this step) and entropy_per_pos
+                # Compute loss AFTER the step (L_{k+1}) by running model on updated x_sphere
+                x_embed_after = x_sphere if self.embed_type == "spherical" else sphere_to_simplex(x_sphere)
+                soft_embeddings_after = torch.matmul(x_embed_after.to(embed_layer.weight.dtype), embed_layer.weight)
+                soft_embeddings_after = torch.where(
+                    loss_mask.unsqueeze(-1).expand_as(soft_embeddings_after),
+                    soft_embeddings_after,
+                    context_embeds,
+                )
+                outputs_after = model(inputs_embeds=soft_embeddings_after, attention_mask=attention_mask)
+                logits_after = outputs_after.logits
+                step_ce_after = F.cross_entropy(
+                    logits_after.transpose(1, 2), input_ids, reduction="none"
+                )  # [b, l]
+
+                # ΔL per position = L_after - L_before
+                delta_L = step_ce_after - step_ce  # [b, l]
+
+                # Bucket by entropy (using entropy from BEFORE the step)
+                # Entropy thresholds: low < 2.0, medium < 5.0, high >= 5.0 (in nats)
+                unwrapped = model.module if hasattr(model, "module") else model
+                max_ent = math.log(unwrapped.config.vocab_size)
+                low_thresh = 0.2 * max_ent  # ~20% of max entropy
+                high_thresh = 0.6 * max_ent  # ~60% of max entropy
+
+                low_entropy_mask = (entropy_per_pos < low_thresh) & loss_mask
+                med_entropy_mask = (entropy_per_pos >= low_thresh) & (entropy_per_pos < high_thresh) & loss_mask
+                high_entropy_mask = (entropy_per_pos >= high_thresh) & loss_mask
+
+                # Compute mean ΔL for each bucket
+                if low_entropy_mask.sum() > 0:
+                    delta_L_low = (delta_L * low_entropy_mask.float()).sum() / low_entropy_mask.sum()
+                    step_delta_L_low.append(delta_L_low.item())
+                else:
+                    step_delta_L_low.append(0.0)
+
+                if med_entropy_mask.sum() > 0:
+                    delta_L_med = (delta_L * med_entropy_mask.float()).sum() / med_entropy_mask.sum()
+                    step_delta_L_med.append(delta_L_med.item())
+                else:
+                    step_delta_L_med.append(0.0)
+
+                if high_entropy_mask.sum() > 0:
+                    delta_L_high = (delta_L * high_entropy_mask.float()).sum() / high_entropy_mask.sum()
+                    step_delta_L_high.append(delta_L_high.item())
+                else:
+                    step_delta_L_high.append(0.0)
+
+                # ============================================================
+                # NEW DIAGNOSTIC 2: Directional contraction test
+                # Measure contraction along the model's update direction (u) and GT direction (g)
+                # u_k = update tangent (expected one-hot drift)
+                # g_k = log_map(x_k, e_y) = direction to ground truth
+                # ============================================================
+                epsilon_dir = 0.01  # Small perturbation magnitude
+
+                # u_k = the tangent we computed (normalized)
+                u_k = tangent / torch.norm(tangent, dim=-1, keepdim=True).clamp(min=1e-8)
+
+                # g_k = log_map(x_sphere_before_step, one_hot(input_ids))
+                # Direction to ground truth one-hot
+                gt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
+                gt_sphere = simplex_to_sphere(gt_onehot)  # sqrt of one-hot = one-hot on sphere
+                g_k = log_map(x_sphere_before_step, gt_sphere)
+                g_k = g_k / torch.norm(g_k, dim=-1, keepdim=True).clamp(min=1e-8)
+
+                # Create perturbed states along u and g directions
+                x_perturb_u = exp_map(x_sphere_before_step, epsilon_dir * u_k)
+                x_perturb_g = exp_map(x_sphere_before_step, epsilon_dir * g_k)
+
+                # Run one step on each perturbed state
+                # For x_perturb_u:
+                x_embed_u = x_perturb_u if self.embed_type == "spherical" else sphere_to_simplex(x_perturb_u)
+                soft_emb_u = torch.matmul(x_embed_u.to(embed_layer.weight.dtype), embed_layer.weight)
+                soft_emb_u = torch.where(loss_mask.unsqueeze(-1).expand_as(soft_emb_u), soft_emb_u, context_embeds)
+                outputs_u = model(inputs_embeds=soft_emb_u, attention_mask=attention_mask)
+                logits_u = outputs_u.logits
+                if eval_temp > 0:
+                    logits_u = logits_u / eval_temp
+                probs_u = F.softmax(logits_u, dim=-1)
+                if use_expected_logmap:
+                    tangent_u = expected_logmap_to_onehots(x_perturb_u, probs_u) * step_weight
+                else:
+                    x1_u = probs_u.sqrt()
+                    tangent_u = log_map(x_perturb_u, x1_u) * step_weight
+                v_norm_u = torch.norm(tangent_u, dim=-1, keepdim=True).clamp(min=1e-8)
+                x_after_u = x_perturb_u * torch.cos(v_norm_u) + tangent_u * torch.sin(v_norm_u) / v_norm_u
+                x_after_u = x_after_u / torch.norm(x_after_u, dim=-1, keepdim=True).clamp(min=1e-8)
+
+                # For x_perturb_g:
+                x_embed_g = x_perturb_g if self.embed_type == "spherical" else sphere_to_simplex(x_perturb_g)
+                soft_emb_g = torch.matmul(x_embed_g.to(embed_layer.weight.dtype), embed_layer.weight)
+                soft_emb_g = torch.where(loss_mask.unsqueeze(-1).expand_as(soft_emb_g), soft_emb_g, context_embeds)
+                outputs_g = model(inputs_embeds=soft_emb_g, attention_mask=attention_mask)
+                logits_g = outputs_g.logits
+                if eval_temp > 0:
+                    logits_g = logits_g / eval_temp
+                probs_g = F.softmax(logits_g, dim=-1)
+                if use_expected_logmap:
+                    tangent_g = expected_logmap_to_onehots(x_perturb_g, probs_g) * step_weight
+                else:
+                    x1_g = probs_g.sqrt()
+                    tangent_g = log_map(x_perturb_g, x1_g) * step_weight
+                v_norm_g = torch.norm(tangent_g, dim=-1, keepdim=True).clamp(min=1e-8)
+                x_after_g = x_perturb_g * torch.cos(v_norm_g) + tangent_g * torch.sin(v_norm_g) / v_norm_g
+                x_after_g = x_after_g / torch.norm(x_after_g, dim=-1, keepdim=True).clamp(min=1e-8)
+
+                # Compute distances
+                # d(x, x_perturb_u) before step
+                d_before_u = torch.acos((x_sphere_before_step * x_perturb_u).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                # d(Phi(x), Phi(x_perturb_u)) after step
+                d_after_u = torch.acos((x_sphere * x_after_u).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                rho_u = d_after_u / d_before_u.clamp(min=1e-8)
+                mean_rho_u = (rho_u * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                step_contraction_u.append(mean_rho_u.item())
+
+                # Same for g direction
+                d_before_g = torch.acos((x_sphere_before_step * x_perturb_g).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                d_after_g = torch.acos((x_sphere * x_after_g).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                rho_g = d_after_g / d_before_g.clamp(min=1e-8)
+                mean_rho_g = (rho_g * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                step_contraction_g.append(mean_rho_g.item())
+
+                # ============================================================
+                # NEW DIAGNOSTIC 3: Support-violation / OOD distance
+                # Measure how far x_sphere is from the training manifold M_t
+                # M_t = {geodesic(x_0, e_k, alpha(t))} for k in top-K tokens
+                # residual r = min_k d(x, m_{t,k})
+                # ============================================================
+                # Get alpha(t) for current time
+                if self.schedule_type == "linear":
+                    alpha_t_curr = t_next
+                else:
+                    alpha_t_curr = 1 - torch.cos(math.pi / 2 * t_next).square()
+
+                # Get top-K tokens under the model (K=5)
+                top_k = 5
+                _, top_k_indices = torch.topk(probs, top_k, dim=-1)  # [b, l, K]
+
+                # For each position, compute distance to closest training manifold point
+                # m_{t,k} = geodesic(x_0, e_k, alpha(t)) where x_0 is the prior sample
+                min_distances = torch.full((b, l), float('inf'), device=device)
+
+                for k_idx in range(top_k):
+                    # Get the k-th top token indices
+                    token_k = top_k_indices[:, :, k_idx]  # [b, l]
+                    # Create one-hot for this token
+                    onehot_k = F.one_hot(token_k, num_classes=vocab_size).float()
+                    sphere_k = simplex_to_sphere(onehot_k)
+                    # Compute training manifold point: geodesic(prior_sample, sphere_k, alpha_t)
+                    # Use geodesic_interpolant
+                    m_t_k = geodesic_interpolant(prior_sample, sphere_k, alpha_t_curr)
+                    # Distance from x_sphere to m_t_k
+                    dot_xm = (x_sphere * m_t_k).sum(dim=-1)
+                    dist_to_m = torch.acos(dot_xm.clamp(-1+1e-7, 1-1e-7))
+                    min_distances = torch.minimum(min_distances, dist_to_m)
+
+                mean_ood_dist = (min_distances * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                step_ood_distance.append(mean_ood_dist.item())
+
+        # ============================================================
+        # NEW DIAGNOSTIC 4: Calibration (compute once at end, not per-step)
+        # Measure accuracy vs confidence for ECE computation
+        # ============================================================
+        # Use final x_sphere to get model's confidence
+        final_probs_calib = sphere_to_simplex(x_sphere)
+        final_confidence, final_predictions = final_probs_calib.max(dim=-1)  # [b, l]
+        correct = (final_predictions == input_ids).float()  # [b, l]
+
+        # Bucket by confidence (10 buckets: 0-0.1, 0.1-0.2, ..., 0.9-1.0)
+        for bucket_idx in range(10):
+            low_conf = bucket_idx / 10.0
+            high_conf = (bucket_idx + 1) / 10.0
+            bucket_mask = (final_confidence >= low_conf) & (final_confidence < high_conf) & loss_mask
+            if bucket_mask.sum() > 0:
+                bucket_correct = (correct * bucket_mask.float()).sum() / bucket_mask.sum()
+                bucket_confidence = (final_confidence * bucket_mask.float()).sum() / bucket_mask.sum()
+                self._diag_calibration_correct[bucket_idx].append(bucket_correct.item())
+                self._diag_calibration_confidence[bucket_idx].append(bucket_confidence.item())
+                self._diag_calibration_count[bucket_idx].append(bucket_mask.sum().item())
+
         # Accumulate step losses, distances, TVs, entropies, and contraction ratios (don't log per-batch)
         for i in range(steps):
             self._diag_step_losses[i].append(step_losses[i])
@@ -532,6 +873,13 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
             self._diag_step_tvs[i].append(step_tvs[i])
             self._diag_step_entropies[i].append(step_entropies[i])
             self._diag_contraction_ratios[i].append(step_contractions[i])
+            # New diagnostics
+            self._diag_delta_L_low_entropy[i].append(step_delta_L_low[i])
+            self._diag_delta_L_med_entropy[i].append(step_delta_L_med[i])
+            self._diag_delta_L_high_entropy[i].append(step_delta_L_high[i])
+            self._diag_contraction_u[i].append(step_contraction_u[i])
+            self._diag_contraction_g[i].append(step_contraction_g[i])
+            self._diag_ood_distance[i].append(step_ood_distance[i])
 
         # Final eval (standard)
         final_probs = sphere_to_simplex(x_sphere)
