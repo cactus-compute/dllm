@@ -39,8 +39,8 @@ from .rdlm_utils import (
 @dataclass
 class BertRDLMSamplerConfig(SamplerConfig):
     """Configuration for RDLM sampler."""
-    # Integration
-    n_steps: int = 100
+    # Integration (RDLM uses 256 for text8, 1000 for lm1b)
+    n_steps: int = 256
     integrator: str = "euler"  # "euler" or "euler_maruyama"
 
     # Prior
@@ -48,10 +48,10 @@ class BertRDLMSamplerConfig(SamplerConfig):
     mixing_prob: float = 0.5
     mask_idx: int = -1
 
-    # Schedule
+    # Schedule (defaults match RDLM paper)
     schedule_type: str = "geometric"  # "geometric", "linear", "cosine"
-    sigma_0: float = 0.001
-    sigma_T: float = 1.0
+    sigma_0: float = 0.001  # beta_0 in RDLM
+    sigma_T: float = 0.2    # beta_f in RDLM (paper uses 0.2)
 
     # Generation
     max_new_tokens: int = 128

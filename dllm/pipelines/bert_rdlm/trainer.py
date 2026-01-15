@@ -42,11 +42,11 @@ class BertRDLMTrainerConfig(TrainingArguments):
     mixing_prob: float = 0.5    # For mixture prior
     mask_idx: int = -1          # Index of mask token (default: last)
 
-    # Schedule configuration
+    # Schedule configuration (defaults match RDLM paper)
     schedule_type: str = "geometric"
-    sigma_0: float = 0.001
-    sigma_T: float = 1.0
-    n_time_steps: int = 1000
+    sigma_0: float = 0.001  # beta_0 in RDLM
+    sigma_T: float = 0.2    # beta_f in RDLM (paper uses 0.2, not 1.0)
+    n_time_steps: int = 10000  # preprocess_steps in RDLM (paper uses 10000)
 
     # Interpolation
     use_riemannian_normal: bool = True
@@ -61,8 +61,8 @@ class BertRDLMTrainerConfig(TrainingArguments):
     # Time sampling
     time_eps: float = 1e-4  # Avoid t=0 and t=1
 
-    # Evaluation - use 100 steps for realistic generation quality measurement
-    eval_integration_steps: int = 100
+    # Evaluation - RDLM uses 256 for text8, 1000 for lm1b
+    eval_integration_steps: int = 256
 
     # Use simplified eval that matches training (single forward pass at random t)
     # instead of full integration. Useful for debugging.

@@ -299,11 +299,11 @@ def precompute_alpha_rho(
 
 @dataclass
 class RDLMScheduleConfig:
-    """Configuration for RDLM noise schedule."""
+    """Configuration for RDLM noise schedule (defaults match RDLM paper)."""
     schedule_type: str = "geometric"
-    sigma_0: float = 0.001
-    sigma_T: float = 1.0
-    n_time_steps: int = 1000
+    sigma_0: float = 0.001   # beta_0 in RDLM
+    sigma_T: float = 0.2     # beta_f in RDLM (paper uses 0.2)
+    n_time_steps: int = 10000  # preprocess_steps in RDLM
     prior_type: str = "uniform"
 
 
@@ -319,8 +319,8 @@ class RDLMSchedule:
         config: Optional[RDLMScheduleConfig] = None,
         schedule_type: str = "geometric",
         sigma_0: float = 0.001,
-        sigma_T: float = 1.0,
-        n_time_steps: int = 1000,
+        sigma_T: float = 0.2,  # RDLM paper default
+        n_time_steps: int = 10000,  # RDLM paper default
         prior_type: str = "uniform",
         device: torch.device = torch.device('cpu'),
         precompute: bool = True
