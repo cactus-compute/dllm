@@ -82,12 +82,12 @@ class TrainingArguments(BertRDLMTrainerConfig):
     warmup_ratio: float = 0.05
     lr_scheduler_type: str = "cosine"
 
-    # RDLM-specific configuration
+    # RDLM-specific configuration (defaults match RDLM paper)
     prior_type: str = "mixture"  # "uniform", "masked", or "mixture"
     mixing_prob: float = 0.5
     schedule_type: str = "geometric"
-    sigma_0: float = 0.001
-    sigma_T: float = 1.0
+    sigma_0: float = 0.001  # beta_0 in RDLM
+    sigma_T: float = 0.2    # beta_f in RDLM (paper uses 0.2, not 1.0)
     n_time_steps: int = 1000
     use_riemannian_normal: bool = True
 

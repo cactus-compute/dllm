@@ -46,7 +46,7 @@ class BertRDLMTrainerConfig(TrainingArguments):
     schedule_type: str = "geometric"
     sigma_0: float = 0.001  # beta_0 in RDLM
     sigma_T: float = 0.2    # beta_f in RDLM (paper uses 0.2, not 1.0)
-    n_time_steps: int = 10000  # preprocess_steps in RDLM (paper uses 10000)
+    n_time_steps: int = 10000  # preprocess_steps in RDLM paper
 
     # Interpolation
     use_riemannian_normal: bool = True

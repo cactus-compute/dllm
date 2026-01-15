@@ -8,12 +8,21 @@ This module provides:
 - Bridge process drift computation
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional, Callable, Tuple
 from tqdm import tqdm
+
+
+def _is_main_process() -> bool:
+    """Check if this is the main process in distributed training."""
+    # Check various environment variables used by different launchers
+    local_rank = os.environ.get("LOCAL_RANK", "0")
+    rank = os.environ.get("RANK", "0")
+    return local_rank == "0" and rank == "0"
 
 # Reuse geodesic utilities from bert_sfm
 from dllm.pipelines.bert_sfm.geodesic_utils import (
@@ -264,7 +273,9 @@ def precompute_alpha_rho(
     alpha_t = torch.zeros(n_time_steps, device=device)
     rho_t = torch.zeros(n_time_steps, device=device)
 
-    for i, t in enumerate(tqdm(t_grid, desc="Precomputing α_t, ρ_t", leave=False)):
+    # Only show progress bar on main process to avoid output conflicts
+    iterator = tqdm(t_grid, desc="Precomputing α_t, ρ_t", leave=False, disable=not _is_main_process())
+    for i, t in enumerate(iterator):
         # Record statistics
         alpha_t[i] = z_T.mean()
         z_0_sq = (1 - z_T ** 2).clamp(min=0)
@@ -303,7 +314,7 @@ class RDLMScheduleConfig:
     schedule_type: str = "geometric"
     sigma_0: float = 0.001   # beta_0 in RDLM
     sigma_T: float = 0.2     # beta_f in RDLM (paper uses 0.2)
-    n_time_steps: int = 10000  # preprocess_steps in RDLM
+    n_time_steps: int = 10000  # preprocess_steps in RDLM paper
     prior_type: str = "uniform"
 
 
