@@ -10,11 +10,17 @@ Metrics Comparison Guide:
 ========================
 
 DIRECTLY COMPARABLE (same semantics):
-- eval_final_loss: Generation loss - the key metric!
+- eval_final_loss: Generation loss with oracle unmasking - the key metric for fair comparison!
   * SFM: -log(integrated_probs[ground_truth]) averaged over tokens
-  * MDLM: -log(P(ground_truth | context)) accumulated over unmasking steps
+  * MDLM: -log(P(ground_truth | oracle_context)) accumulated over unmasking steps
   * Both answer: "How much probability does the model assign to the correct sequence?"
   * Lower is better, comparable magnitudes, fair comparison
+
+- eval_final_loss_greedy: Generation loss with greedy unmasking (MDLM-specific)
+  * Uses model predictions instead of ground truth for unmasking
+  * Shows realistic generation quality with error compounding
+  * Will be >= eval_final_loss (errors accumulate)
+  * No direct SFM equivalent (SFM uses soft distributions, never commits to discrete tokens)
 
 - eval_loss_t_{bucket}: Loss at different corruption levels
   * SFM: Loss at time t (soft interpolation between noise and target)
@@ -120,7 +126,8 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
         self._diag_step_losses = [[] for _ in range(steps)]
         self._diag_step_entropies = [[] for _ in range(steps)]  # Entropy per step
         self._diag_step_mask_rates = [[] for _ in range(steps)]  # Remaining mask % per step
-        self._diag_final_losses = []
+        self._diag_final_losses = []  # Oracle unmasking (fair comparison with SFM)
+        self._diag_final_losses_greedy = []  # Greedy unmasking (realistic generation)
         self._diag_batch_count = 0
 
     def evaluation_loop(self, dataloader, description, prediction_loss_only=None, ignore_keys=None, metric_key_prefix="eval"):
@@ -161,10 +168,14 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
                 for i in range(steps)
             ]
 
-            # Average final loss
+            # Average final losses
             avg_final_loss = (
                 sum(self._diag_final_losses) / len(self._diag_final_losses)
                 if self._diag_final_losses else 0.0
+            )
+            avg_final_loss_greedy = (
+                sum(self._diag_final_losses_greedy) / len(self._diag_final_losses_greedy)
+                if self._diag_final_losses_greedy else 0.0
             )
 
             # Compute max entropy for percentage calculation
@@ -181,6 +192,7 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
                 all_logs[f"eval_step_{i}_entropy_pct"] = 100.0 * avg_step_entropies[i] / max_entropy
                 all_logs[f"eval_step_{i}_mask_rate"] = avg_step_mask_rates[i]
             all_logs["eval_final_loss"] = avg_final_loss
+            all_logs["eval_final_loss_greedy"] = avg_final_loss_greedy
             all_logs["eval_mean_step_entropy"] = sum(avg_step_entropies) / len(avg_step_entropies) if avg_step_entropies else 0.0
             all_logs["eval_mean_step_entropy_pct"] = 100.0 * all_logs["eval_mean_step_entropy"] / max_entropy
 
@@ -199,7 +211,8 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
                 entropy_pct = 100.0 * avg_step_entropies[i] / max_entropy
                 mask_rate = avg_step_mask_rates[i]
                 print(f"  step {i}: loss={avg_step_losses[i]:.4f}, entropy={entropy_pct:.1f}%, mask_rate={mask_rate:.1f}%")
-            print(f"\nFinal eval loss: {avg_final_loss:.4f}")
+            print(f"\nFinal eval loss (oracle):  {avg_final_loss:.4f}  <- fair comparison with SFM")
+            print(f"Final eval loss (greedy):  {avg_final_loss_greedy:.4f}  <- realistic generation with error compounding")
             mean_entropy_pct = 100.0 * sum(avg_step_entropies) / len(avg_step_entropies) / max_entropy if avg_step_entropies else 0.0
             print(f"Mean step entropy: {mean_entropy_pct:.1f}% of max (low = confident, high = uncertain)")
             print("=" * 50)
@@ -266,7 +279,7 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
             self._diag_bucket_losses[i].append(bucket_losses[i])
 
         # ============================================================
-        # DIAGNOSTIC 2: Progressive unmasking (eval-style)
+        # DIAGNOSTIC 2: Progressive unmasking (eval-style) with greedy NLL
         # ============================================================
         steps = self.eval_unmasking_steps
         step_losses = []
@@ -280,10 +293,13 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
         # Track which positions are still masked
         still_masked = loss_mask.clone()
 
+        # Accumulate greedy NLL alongside step metrics
+        greedy_cumulative_nll = torch.zeros(b, device=device)
+        greedy_tokens_scored = torch.zeros(b, device=device)
+
         for step_idx in range(steps):
             # How many tokens to unmask this step
             # Linear schedule: unmask equal fraction each step
-            total_masked = still_masked.sum(dim=1).float()
             tokens_per_step = num_to_generate.float() / steps
 
             with torch.no_grad():
@@ -291,6 +307,7 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
                 outputs = model(input_ids=current_ids, attention_mask=attention_mask)
                 logits = outputs.logits
                 probs = F.softmax(logits, dim=-1)
+                log_probs = F.log_softmax(logits, dim=-1)
 
                 # Compute loss on still-masked positions
                 step_ce = F.cross_entropy(
@@ -308,11 +325,11 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
                 mask_rate = 100.0 * still_masked.sum().float() / loss_mask.sum().clamp_min(1)
                 step_mask_rates.append(mask_rate.item())
 
-                # Unmask tokens with highest confidence (lowest entropy)
-                # Get predictions for masked positions
-                predicted_tokens = logits.argmax(dim=-1)
+                # Get log prob of ground truth for greedy NLL accumulation
+                gt_log_probs = log_probs.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
 
-                # Confidence score: max probability
+                # Unmask tokens with highest confidence
+                predicted_tokens = logits.argmax(dim=-1)
                 confidence = probs.max(dim=-1).values  # [b, l]
 
                 # For each sequence, unmask the most confident masked positions
@@ -333,9 +350,17 @@ class DiagnosticMDLMTrainer(MDLMTrainer):
                     _, top_indices = masked_confidence.topk(n_unmask)
                     positions_to_unmask = masked_positions[top_indices]
 
+                    # Accumulate greedy NLL for these positions
+                    greedy_cumulative_nll[batch_idx] -= gt_log_probs[batch_idx, positions_to_unmask].sum()
+                    greedy_tokens_scored[batch_idx] += n_unmask
+
                     # Unmask: replace mask token with predicted token
                     current_ids[batch_idx, positions_to_unmask] = predicted_tokens[batch_idx, positions_to_unmask]
                     still_masked[batch_idx, positions_to_unmask] = False
+
+        # Compute greedy final loss
+        final_loss_greedy = greedy_cumulative_nll.sum() / greedy_tokens_scored.sum().clamp_min(1)
+        self._diag_final_losses_greedy.append(final_loss_greedy.item())
 
         # Accumulate step metrics
         for i in range(steps):
