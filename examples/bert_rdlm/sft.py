@@ -116,8 +116,8 @@ class TrainingArguments(BertRDLMTrainerConfig):
     logging_steps: int = 10
     report_to: str = "wandb"  # or "tensorboard" or "none"
 
-    # Mixed precision (set via accelerate launch --mixed_precision)
-    bf16: bool = False  # Will be set by accelerate
+    # Mixed precision - bf16=True for DeepSpeed compatibility
+    bf16: bool = True
     fp16: bool = False
 
     # Optimization
