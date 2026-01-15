@@ -4,6 +4,7 @@ BertRDLMSampler: Sampler class for BERT with RDLM objective.
 Implements sampling from RDLM using Euler-Maruyama integration.
 """
 
+import math
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -148,8 +149,12 @@ class BertRDLMSampler(BaseSampler):
 
         # Compute tangent based on prediction type
         if config.prediction_type == "endpoint":
+            # Model predicts distribution over endpoints (tokens)
+            # Compute expected log-map toward one-hots weighted by probabilities
+            # This matches RDLM's weighted_sum operation
             probs = F.softmax(logits, dim=-1)
-            tangent = expected_logmap_to_onehots(x_sphere, probs)
+            # Use positive_orthant=False to handle full sphere (RDLM style)
+            tangent = expected_logmap_to_onehots(x_sphere, probs, positive_orthant=False)
         elif config.prediction_type == "drift":
             tangent = make_tangent(x_sphere, logits)
         else:
@@ -209,21 +214,30 @@ class BertRDLMSampler(BaseSampler):
                 config, t_tensor, config.temperature, embed_layer, time_embedding
             )
 
-            # Compute step weight based on prediction type
+            # Scale by drift coefficient and dt
+            # RDLM drift_coeff depends on schedule type:
+            # - Geometric with sigma_0 == sigma_T: drift_coeff = 1 / (1-t)
+            # - Geometric with sigma_0 != sigma_T: drift_coeff = log(r) / (r^(1-t) - 1)
             if config.prediction_type == "endpoint":
-                # For endpoint prediction: step_weight = dt / (1-t)
-                step_weight = dt / max(1 - t, 1e-4)
-                tangent = tangent * step_weight
+                if abs(config.sigma_0 - config.sigma_T) < 1e-8:
+                    # Constant sigma case
+                    drift_coeff = 1.0 / max(1 - t, 1e-4)
+                else:
+                    # General geometric case
+                    r = config.sigma_T / config.sigma_0
+                    drift_coeff = math.log(r) / max(r ** (1 - t) - 1, 1e-8)
+                tangent = tangent * drift_coeff * dt
             else:
-                # For drift prediction: step_weight = dt
                 tangent = tangent * dt
 
-            # Add stochastic noise if enabled
+            # Add stochastic noise if enabled (Euler-Maruyama)
+            # RDLM uses: sqrt(beta(t)) * z * sqrt(dt) where beta = sigma in our notation
+            # So total noise scale is sqrt(sigma_t * dt)
             if config.stochastic:
                 sigma_t = sigma_fn(t_tensor)
                 noise = torch.randn_like(x_sphere)
                 noise = make_tangent(x_sphere, noise)
-                tangent = tangent + sigma_t * noise * (dt ** 0.5)
+                tangent = tangent + noise * (sigma_t * dt).sqrt()
 
             # Take step via exponential map
             x_new = exp_map(x_sphere, tangent)

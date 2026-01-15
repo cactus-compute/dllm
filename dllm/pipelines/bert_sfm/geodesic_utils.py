@@ -244,8 +244,17 @@ def simplex_to_sphere(p: torch.Tensor) -> torch.Tensor:
 
 
 def sphere_to_simplex(x: torch.Tensor) -> torch.Tensor:
-    """Map sphere point back to simplex via squaring."""
-    return x**2
+    """Map sphere point back to simplex via squaring.
+
+    Following RDLM: first clip negative values to 0, renormalize to sphere,
+    then square to get probabilities on the simplex.
+    """
+    # Clip negatives to 0 (project to positive orthant)
+    pos = torch.clamp(x, min=0.0)
+    # Renormalize to unit sphere
+    pos = pos / pos.square().sum(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+    # Square to get simplex probabilities
+    return pos.square()
 
 
 # ============== Prior Sampling ==============
@@ -313,7 +322,10 @@ def cosine_schedule(
 
 
 def expected_logmap_to_onehots(
-    x_t: torch.Tensor, probs: torch.Tensor, eps: float = 1e-6
+    x_t: torch.Tensor,
+    probs: torch.Tensor,
+    eps: float = 1e-6,
+    positive_orthant: bool = True,
 ) -> torch.Tensor:
     """
     Compute E_{k~probs}[log_map(x_t, e_k)] on the unit sphere.
@@ -333,17 +345,24 @@ def expected_logmap_to_onehots(
     where c_k = arccos(x_t[k]) / sqrt(1 - x_t[k]^2) and u = probs * c (elementwise).
 
     Args:
-        x_t: Current point on sphere, shape (..., V), assumed unit norm in positive orthant
+        x_t: Current point on sphere, shape (..., V), unit norm
         probs: Softmax distribution over vocab, shape (..., V)
         eps: Small constant for numerical stability
+        positive_orthant: If True (default, for SFM), clamp to [eps, 1-eps].
+                         If False (for RDLM), clamp to [-1+eps, 1-eps] to handle full sphere.
 
     Returns:
         Tangent vector at x_t, shape (..., V)
     """
-    # Clamp x_t to avoid numerical issues at boundaries
-    x = x_t.clamp(min=eps, max=1 - eps)
+    # Clamp x_t to valid range for arccos
+    if positive_orthant:
+        # SFM: assume positive orthant only
+        x = x_t.clamp(min=eps, max=1.0 - eps)
+    else:
+        # RDLM: handle full sphere (matches RDLM's weighted_sum)
+        x = x_t.clamp(min=-1.0 + eps, max=1.0 - eps)
 
-    # c_k = arccos(x_k) / sqrt(1 - x_k^2)
+    # c_k = arccos(x_k) / sin(arccos(x_k)) = arccos(x_k) / sqrt(1 - x_k^2)
     # This is the coefficient for each one-hot direction
     denom = (1.0 - x * x).clamp_min(eps).sqrt()
     c = torch.arccos(x) / denom

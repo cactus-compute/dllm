@@ -64,6 +64,10 @@ class BertRDLMTrainerConfig(TrainingArguments):
     # Evaluation - use 100 steps for realistic generation quality measurement
     eval_integration_steps: int = 100
 
+    # Use simplified eval that matches training (single forward pass at random t)
+    # instead of full integration. Useful for debugging.
+    eval_simple: bool = False
+
     # Time embedding
     use_time_embedding: bool = False
     time_embedding_scale: float = 30.0
@@ -97,6 +101,7 @@ class BertRDLMTrainer(transformers.Trainer):
         self.embed_type = args.embed_type
         self.time_eps = args.time_eps
         self.eval_integration_steps = args.eval_integration_steps
+        self.eval_simple = args.eval_simple
         self.use_time_embedding = args.use_time_embedding
         self.time_embedding_scale = args.time_embedding_scale
 
@@ -360,10 +365,11 @@ class BertRDLMTrainer(transformers.Trainer):
         ignore_keys: Optional[list] = None,
     ):
         """
-        Evaluation step for RDLM using flow integration.
-        """
-        from dllm.pipelines.bert_rdlm.sampler import BertRDLMSampler, BertRDLMSamplerConfig
+        Evaluation step for RDLM.
 
+        If eval_simple=True: single forward pass at random t (matches training)
+        If eval_simple=False: full flow integration (measures generation quality)
+        """
         input_ids = inputs["input_ids"]
         labels = inputs["labels"]
         attention_mask = inputs.get("attention_mask", None)
@@ -372,6 +378,15 @@ class BertRDLMTrainer(transformers.Trainer):
         unwrapped_model = model.module if hasattr(model, 'module') else model
         vocab_size = unwrapped_model.config.vocab_size
         device = input_ids.device
+
+        # Get the actual model device (may differ from input device due to HF Trainer)
+        model_device = next(unwrapped_model.parameters()).device
+        if device != model_device:
+            device = model_device
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
 
         # Ensure schedule is initialized
         self._ensure_schedule(device)
@@ -386,70 +401,115 @@ class BertRDLMTrainer(transformers.Trainer):
             embed_layer = unwrapped_model.model.embed_tokens
         compute_dtype = embed_layer.weight.dtype
 
-        # Initialize sphere state
-        # For prompt positions: use one-hot on sphere
-        prompt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
-        x_sphere = simplex_to_sphere(prompt_onehot)
+        if self.eval_simple:
+            # Simple eval: single forward pass at random t (matches training)
+            eps = self.time_eps
+            t = eps + (1 - 2 * eps) * torch.rand(B, device=device)
 
-        # For flow positions: sample from RDLM prior
-        prior_sample = self.get_prior_samples(
-            (B, L, vocab_size), device, compute_dtype
-        )
-        x_sphere = torch.where(
-            loss_mask.unsqueeze(-1).expand_as(x_sphere),
-            prior_sample,
-            x_sphere,
-        )
+            # Sample from prior
+            x0 = self.get_prior_samples((B, L, vocab_size), device, compute_dtype, t)
 
-        # Get discrete embeddings for context
-        context_embeds = embed_layer(input_ids)
+            # Get interpolated samples
+            xt = self.interpolate(x0, input_ids, t)
 
-        # Create sampler and config
-        sampler = BertRDLMSampler(
-            model=model,
-            tokenizer=self.processing_class,
-            rdlm_schedule=self.rdlm_schedule,
-        )
-        config = BertRDLMSamplerConfig(
-            n_steps=self.eval_integration_steps,
-            integrator="euler",
-            prior_type=self.prior_type,
-            schedule_type=self.schedule_config.schedule_type,
-            sigma_0=self.schedule_config.sigma_0,
-            sigma_T=self.schedule_config.sigma_T,
-            temperature=0.0,
-            embed_type=self.embed_type,
-        )
+            # Keep prompt positions clean
+            if not loss_mask.all():
+                prompt_mask = ~loss_mask
+                xt[prompt_mask] = 0
+                prompt_indices = input_ids[prompt_mask].unsqueeze(-1)
+                xt[prompt_mask] = xt[prompt_mask].scatter(-1, prompt_indices, 1.0)
 
-        # Run flow integration
-        x_sphere = sampler.flow_integrate(
-            x_sphere=x_sphere,
-            flow_mask=loss_mask,
-            context_embeds=context_embeds,
-            attention_mask=attention_mask,
-            config=config,
-            time_embedding=self.time_embedding if self.use_time_embedding else None,
-        )
+            # Compute soft embeddings
+            x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
+            soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
 
-        # Compute final loss
-        final_probs = sphere_to_simplex(x_sphere)
-        final_log_probs = torch.log(final_probs.clamp(min=1e-10))
+            # Add time embedding if enabled
+            if self.use_time_embedding and self.time_embedding is not None:
+                time_emb = self.time_embedding(t)
+                soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
 
-        token_nll = F.nll_loss(
-            final_log_probs.transpose(1, 2),
-            input_ids,
-            reduction="none",
-        )
-        token_nll = token_nll * loss_mask.float()
+            # Forward pass
+            outputs = model(
+                inputs_embeds=soft_embeddings,
+                attention_mask=attention_mask,
+            )
+            logits = outputs.logits
+
+            # CE loss
+            token_loss = F.cross_entropy(
+                logits.transpose(1, 2),
+                input_ids,
+                reduction='none'
+            )
+            token_loss = token_loss * loss_mask.float()
+
+        else:
+            # Full integration eval
+            from dllm.pipelines.bert_rdlm.sampler import BertRDLMSampler, BertRDLMSamplerConfig
+
+            # Initialize sphere state
+            prompt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
+            x_sphere = simplex_to_sphere(prompt_onehot)
+
+            # For flow positions: sample from RDLM prior
+            prior_sample = self.get_prior_samples(
+                (B, L, vocab_size), device, compute_dtype
+            )
+            x_sphere = torch.where(
+                loss_mask.unsqueeze(-1).expand_as(x_sphere),
+                prior_sample,
+                x_sphere,
+            )
+
+            # Get discrete embeddings for context
+            context_embeds = embed_layer(input_ids)
+
+            # Create sampler and config
+            sampler = BertRDLMSampler(
+                model=model,
+                tokenizer=self.processing_class,
+                rdlm_schedule=self.rdlm_schedule,
+            )
+            config = BertRDLMSamplerConfig(
+                n_steps=self.eval_integration_steps,
+                integrator="euler",
+                prior_type=self.prior_type,
+                schedule_type=self.schedule_config.schedule_type,
+                sigma_0=self.schedule_config.sigma_0,
+                sigma_T=self.schedule_config.sigma_T,
+                temperature=0.0,
+                embed_type=self.embed_type,
+            )
+
+            # Run flow integration
+            x_sphere = sampler.flow_integrate(
+                x_sphere=x_sphere,
+                flow_mask=loss_mask,
+                context_embeds=context_embeds,
+                attention_mask=attention_mask,
+                config=config,
+                time_embedding=self.time_embedding if self.use_time_embedding else None,
+            )
+
+            # Compute final loss
+            final_probs = sphere_to_simplex(x_sphere)
+            final_log_probs = torch.log(final_probs.clamp(min=1e-10))
+
+            token_loss = F.nll_loss(
+                final_log_probs.transpose(1, 2),
+                input_ids,
+                reduction="none",
+            )
+            token_loss = token_loss * loss_mask.float()
 
         # Update metrics
         self.meter.update(
             split="eval",
-            value=token_nll.detach(),
+            value=token_loss.detach(),
             weight=loss_mask.float().detach(),
         )
 
-        loss = token_nll.sum() / loss_mask.sum().clamp_min(1)
+        loss = token_loss.sum() / loss_mask.sum().clamp_min(1)
 
         if prediction_loss_only:
             return (loss.detach(), None, None)
