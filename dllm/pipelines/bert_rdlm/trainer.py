@@ -335,11 +335,9 @@ class BertRDLMTrainer(transformers.Trainer):
 
         soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
 
-        # Free xt if we don't need it for MSE loss
+        # Free xt and x_embed if we don't need them for MSE loss
         if self.loss_type == "ce":
-            del xt
-            if x_embed is not xt:
-                del x_embed
+            del xt, x_embed
 
         # Add time embedding if enabled
         if self.use_time_embedding:
