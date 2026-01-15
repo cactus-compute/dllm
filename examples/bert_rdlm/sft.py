@@ -100,10 +100,10 @@ class TrainingArguments(BertRDLMTrainerConfig):
     use_time_embedding: bool = True
     time_embedding_scale: float = 30.0
 
-    # Evaluation - 100 steps for realistic generation quality
+    # Evaluation - RDLM uses 256 for text8, 1000 for lm1b
     eval_strategy: str = "steps"
     eval_steps: float = 0.1  # Every 10% of training
-    eval_integration_steps: int = 100  # Must match inference for true performance
+    eval_integration_steps: int = 256  # RDLM paper default
 
     # Saving
     save_strategy: str = "steps"
