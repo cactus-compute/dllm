@@ -104,6 +104,10 @@ class TrainingArguments(BertSFMTrainer.BertSFMConfig):
     # Significantly more stable and accurate than the legacy sqrt(probs) approach.
     # Default: True (recommended). Set to False only for legacy compatibility.
     use_expected_logmap: bool = True
+    # Enable expensive diagnostics (directional contraction, OOD distance)
+    # These require extra forward passes per step and use significant memory
+    # Set to False for faster/lighter evaluation, True for full diagnostics
+    enable_expensive_diagnostics: bool = False
 
 
 class DiagnosticBertSFMTrainer(BertSFMTrainer):
@@ -476,7 +480,9 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
         step_contraction_u = []
         step_contraction_g = []
         step_ood_distance = []
-        prev_loss = None  # For computing ΔL
+        # For computing ΔL efficiently without extra forward pass
+        prev_step_ce = None
+        prev_entropy_per_pos = None
 
         # Pre-expand flow_mask
         flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(x_sphere)
@@ -616,233 +622,220 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                 mean_entropy = (entropy_per_pos * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
                 step_entropies.append(mean_entropy.item())
 
+                # Check if expensive diagnostics are enabled
+                enable_expensive = getattr(self.args, 'enable_expensive_diagnostics', False)
+
                 # ============================================================
-                # DIAGNOSTIC 4: Local contraction test
-                # Run the same step on the perturbed x_sphere_perturbed and measure
-                # rho = d(Phi(x), Phi(x')) / d(x, x')
-                # If rho < 1 -> locally contractive (multi-step helps)
-                # If rho > 1 -> locally expansive (multi-step may diverge)
+                # DIAGNOSTIC 4: Local contraction test (random direction)
+                # Only run if expensive diagnostics enabled
                 # ============================================================
-                # Compute soft embeddings for perturbed state
-                x_embed_p = x_sphere_perturbed if self.embed_type == "spherical" else sphere_to_simplex(x_sphere_perturbed)
-                soft_embeddings_p = torch.matmul(x_embed_p.to(embed_layer.weight.dtype), embed_layer.weight)
-                soft_embeddings_p = torch.where(
-                    loss_mask.unsqueeze(-1).expand_as(soft_embeddings_p),
-                    soft_embeddings_p,
-                    context_embeds,
-                )
+                if enable_expensive:
+                    x_embed_p = x_sphere_perturbed if self.embed_type == "spherical" else sphere_to_simplex(x_sphere_perturbed)
+                    soft_embeddings_p = torch.matmul(x_embed_p.to(embed_layer.weight.dtype), embed_layer.weight)
+                    soft_embeddings_p = torch.where(
+                        loss_mask.unsqueeze(-1).expand_as(soft_embeddings_p),
+                        soft_embeddings_p,
+                        context_embeds,
+                    )
+                    outputs_p = model(inputs_embeds=soft_embeddings_p, attention_mask=attention_mask)
+                    logits_p = outputs_p.logits
+                    del soft_embeddings_p, x_embed_p
 
-                # Forward pass on perturbed state
-                outputs_p = model(inputs_embeds=soft_embeddings_p, attention_mask=attention_mask)
-                logits_p = outputs_p.logits
+                    if eval_temp > 0:
+                        logits_p = logits_p / eval_temp
 
-                # Apply same temperature
-                if eval_temp > 0:
-                    logits_p = logits_p / eval_temp
-
-                # Take integration step on perturbed state (same as main state)
-                if self.loss_type == "mse":
-                    velocity_p = make_tangent(x_sphere_perturbed, logits_p)
-                    tangent_p = velocity_p * dt
-                else:
-                    probs_p = F.softmax(logits_p, dim=-1)
-                    if use_expected_logmap:
-                        tangent_p = expected_logmap_to_onehots(x_sphere_perturbed, probs_p) * step_weight
+                    if self.loss_type == "mse":
+                        velocity_p = make_tangent(x_sphere_perturbed, logits_p)
+                        tangent_p = velocity_p * dt
                     else:
-                        x_1_pred_p = probs_p.sqrt()
-                        dot_pq_p = (x_sphere_perturbed * x_1_pred_p).sum(dim=-1, keepdim=True)
-                        q_proj_p = x_1_pred_p - dot_pq_p * x_sphere_perturbed
-                        q_proj_norm_p = torch.norm(q_proj_p, dim=-1, keepdim=True).clamp(min=1e-8)
-                        dot_clamped_p = dot_pq_p.clamp(-1 + 1e-7, 1 - 1e-7)
-                        dist_p = torch.acos(dot_clamped_p)
-                        tangent_p = q_proj_p / q_proj_norm_p * dist_p * step_weight
+                        probs_p = F.softmax(logits_p, dim=-1)
+                        if use_expected_logmap:
+                            tangent_p = expected_logmap_to_onehots(x_sphere_perturbed, probs_p) * step_weight
+                        else:
+                            x_1_pred_p = probs_p.sqrt()
+                            dot_pq_p = (x_sphere_perturbed * x_1_pred_p).sum(dim=-1, keepdim=True)
+                            q_proj_p = x_1_pred_p - dot_pq_p * x_sphere_perturbed
+                            q_proj_norm_p = torch.norm(q_proj_p, dim=-1, keepdim=True).clamp(min=1e-8)
+                            dot_clamped_p = dot_pq_p.clamp(-1 + 1e-7, 1 - 1e-7)
+                            dist_p = torch.acos(dot_clamped_p)
+                            tangent_p = q_proj_p / q_proj_norm_p * dist_p * step_weight
+                        del probs_p
+                    del logits_p
 
-                # Apply exp_map to get new perturbed position
-                v_norm_p = torch.norm(tangent_p, dim=-1, keepdim=True).clamp(min=1e-8)
-                x_sphere_perturbed_new = x_sphere_perturbed * torch.cos(v_norm_p) + tangent_p * torch.sin(v_norm_p) / v_norm_p
-                x_sphere_perturbed_new = x_sphere_perturbed_new / torch.norm(x_sphere_perturbed_new, dim=-1, keepdim=True).clamp(min=1e-8)
+                    v_norm_p = torch.norm(tangent_p, dim=-1, keepdim=True).clamp(min=1e-8)
+                    x_sphere_perturbed_new = x_sphere_perturbed * torch.cos(v_norm_p) + tangent_p * torch.sin(v_norm_p) / v_norm_p
+                    x_sphere_perturbed_new = x_sphere_perturbed_new / torch.norm(x_sphere_perturbed_new, dim=-1, keepdim=True).clamp(min=1e-8)
+                    del tangent_p, v_norm_p
 
-                # Update only flow positions for perturbed state
-                x_sphere_perturbed = torch.where(flow_mask_expanded, x_sphere_perturbed_new, x_sphere_perturbed)
+                    x_sphere_perturbed = torch.where(flow_mask_expanded, x_sphere_perturbed_new, x_sphere_perturbed)
+                    del x_sphere_perturbed_new
 
-                # Compute distance after step: d(Phi(x), Phi(x'))
-                dot_after = (x_sphere * x_sphere_perturbed).sum(dim=-1)
-                dist_after = torch.acos(dot_after.clamp(-1 + 1e-7, 1 - 1e-7))  # [b, l]
-
-                # Compute contraction ratio rho = d_after / d_before
-                # Use initial_dist (before any steps) as d_before to avoid division issues
-                # For per-step ratio, we should track d_before at each step
-                contraction_ratio = dist_after / initial_dist.clamp(min=1e-8)
-                mean_contraction = (contraction_ratio * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
-                step_contractions.append(mean_contraction.item())
-
-                # Update initial_dist for next step (so we measure per-step contraction)
-                initial_dist = dist_after
-
-                # ============================================================
-                # NEW DIAGNOSTIC 1: One-step improvement test (ΔL bucketed by entropy)
-                # Measures ΔL = L_{k+1} - L_k and buckets by model's entropy at step k
-                # If low entropy + wrong → ΔL strongly positive (catastrophic feedback)
-                # ============================================================
-                # We already have step_ce (CE loss at this step) and entropy_per_pos
-                # Compute loss AFTER the step (L_{k+1}) by running model on updated x_sphere
-                x_embed_after = x_sphere if self.embed_type == "spherical" else sphere_to_simplex(x_sphere)
-                soft_embeddings_after = torch.matmul(x_embed_after.to(embed_layer.weight.dtype), embed_layer.weight)
-                soft_embeddings_after = torch.where(
-                    loss_mask.unsqueeze(-1).expand_as(soft_embeddings_after),
-                    soft_embeddings_after,
-                    context_embeds,
-                )
-                outputs_after = model(inputs_embeds=soft_embeddings_after, attention_mask=attention_mask)
-                logits_after = outputs_after.logits
-                step_ce_after = F.cross_entropy(
-                    logits_after.transpose(1, 2), input_ids, reduction="none"
-                )  # [b, l]
-
-                # ΔL per position = L_after - L_before
-                delta_L = step_ce_after - step_ce  # [b, l]
-
-                # Bucket by entropy (using entropy from BEFORE the step)
-                # Entropy thresholds: low < 2.0, medium < 5.0, high >= 5.0 (in nats)
-                unwrapped = model.module if hasattr(model, "module") else model
-                max_ent = math.log(unwrapped.config.vocab_size)
-                low_thresh = 0.2 * max_ent  # ~20% of max entropy
-                high_thresh = 0.6 * max_ent  # ~60% of max entropy
-
-                low_entropy_mask = (entropy_per_pos < low_thresh) & loss_mask
-                med_entropy_mask = (entropy_per_pos >= low_thresh) & (entropy_per_pos < high_thresh) & loss_mask
-                high_entropy_mask = (entropy_per_pos >= high_thresh) & loss_mask
-
-                # Compute mean ΔL for each bucket
-                if low_entropy_mask.sum() > 0:
-                    delta_L_low = (delta_L * low_entropy_mask.float()).sum() / low_entropy_mask.sum()
-                    step_delta_L_low.append(delta_L_low.item())
+                    dot_after = (x_sphere * x_sphere_perturbed).sum(dim=-1)
+                    dist_after = torch.acos(dot_after.clamp(-1 + 1e-7, 1 - 1e-7))
+                    contraction_ratio = dist_after / initial_dist.clamp(min=1e-8)
+                    mean_contraction = (contraction_ratio * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                    step_contractions.append(mean_contraction.item())
+                    initial_dist = dist_after
                 else:
+                    step_contractions.append(0.0)
+
+                # ============================================================
+                # DIAGNOSTIC 5: One-step improvement test (ΔL bucketed by entropy)
+                # This is CHEAP - uses previous iteration's data, NO extra forward pass
+                # ΔL at step k-1 = step_ce[k] - step_ce[k-1]
+                # ============================================================
+                if prev_step_ce is not None:
+                    # ΔL = current_loss - previous_loss (how much did the step hurt/help?)
+                    delta_L = step_ce - prev_step_ce
+
+                    # Bucket by entropy from PREVIOUS step (when decision was made)
+                    unwrapped = model.module if hasattr(model, "module") else model
+                    max_ent = math.log(unwrapped.config.vocab_size)
+                    low_thresh = 0.2 * max_ent
+                    high_thresh = 0.6 * max_ent
+
+                    low_entropy_mask = (prev_entropy_per_pos < low_thresh) & loss_mask
+                    med_entropy_mask = (prev_entropy_per_pos >= low_thresh) & (prev_entropy_per_pos < high_thresh) & loss_mask
+                    high_entropy_mask = (prev_entropy_per_pos >= high_thresh) & loss_mask
+
+                    if low_entropy_mask.sum() > 0:
+                        delta_L_low_val = (delta_L * low_entropy_mask.float()).sum() / low_entropy_mask.sum()
+                        step_delta_L_low.append(delta_L_low_val.item())
+                    else:
+                        step_delta_L_low.append(0.0)
+
+                    if med_entropy_mask.sum() > 0:
+                        delta_L_med_val = (delta_L * med_entropy_mask.float()).sum() / med_entropy_mask.sum()
+                        step_delta_L_med.append(delta_L_med_val.item())
+                    else:
+                        step_delta_L_med.append(0.0)
+
+                    if high_entropy_mask.sum() > 0:
+                        delta_L_high_val = (delta_L * high_entropy_mask.float()).sum() / high_entropy_mask.sum()
+                        step_delta_L_high.append(delta_L_high_val.item())
+                    else:
+                        step_delta_L_high.append(0.0)
+                else:
+                    # First step - no previous data
                     step_delta_L_low.append(0.0)
-
-                if med_entropy_mask.sum() > 0:
-                    delta_L_med = (delta_L * med_entropy_mask.float()).sum() / med_entropy_mask.sum()
-                    step_delta_L_med.append(delta_L_med.item())
-                else:
                     step_delta_L_med.append(0.0)
-
-                if high_entropy_mask.sum() > 0:
-                    delta_L_high = (delta_L * high_entropy_mask.float()).sum() / high_entropy_mask.sum()
-                    step_delta_L_high.append(delta_L_high.item())
-                else:
                     step_delta_L_high.append(0.0)
 
+                # Store for next iteration
+                prev_step_ce = step_ce.clone()
+                prev_entropy_per_pos = entropy_per_pos.clone()
+
                 # ============================================================
-                # NEW DIAGNOSTIC 2: Directional contraction test
-                # Measure contraction along the model's update direction (u) and GT direction (g)
-                # u_k = update tangent (expected one-hot drift)
-                # g_k = log_map(x_k, e_y) = direction to ground truth
+                # EXPENSIVE DIAGNOSTICS 2-3: Only run if enabled
+                # These require extra forward passes
                 # ============================================================
-                epsilon_dir = 0.01  # Small perturbation magnitude
+                if enable_expensive:
+                    # DIAGNOSTIC 2: Directional contraction test
+                    epsilon_dir = 0.01
+                    u_k = tangent / torch.norm(tangent, dim=-1, keepdim=True).clamp(min=1e-8)
 
-                # u_k = the tangent we computed (normalized)
-                u_k = tangent / torch.norm(tangent, dim=-1, keepdim=True).clamp(min=1e-8)
+                    gt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
+                    gt_sphere = simplex_to_sphere(gt_onehot)
+                    g_k = log_map(x_sphere_before_step, gt_sphere)
+                    g_k = g_k / torch.norm(g_k, dim=-1, keepdim=True).clamp(min=1e-8)
+                    del gt_onehot, gt_sphere
 
-                # g_k = log_map(x_sphere_before_step, one_hot(input_ids))
-                # Direction to ground truth one-hot
-                gt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
-                gt_sphere = simplex_to_sphere(gt_onehot)  # sqrt of one-hot = one-hot on sphere
-                g_k = log_map(x_sphere_before_step, gt_sphere)
-                g_k = g_k / torch.norm(g_k, dim=-1, keepdim=True).clamp(min=1e-8)
+                    x_perturb_u = exp_map(x_sphere_before_step, epsilon_dir * u_k)
+                    x_perturb_g = exp_map(x_sphere_before_step, epsilon_dir * g_k)
+                    del u_k, g_k
 
-                # Create perturbed states along u and g directions
-                x_perturb_u = exp_map(x_sphere_before_step, epsilon_dir * u_k)
-                x_perturb_g = exp_map(x_sphere_before_step, epsilon_dir * g_k)
+                    # Forward pass for u direction
+                    x_embed_u = x_perturb_u if self.embed_type == "spherical" else sphere_to_simplex(x_perturb_u)
+                    soft_emb_u = torch.matmul(x_embed_u.to(embed_layer.weight.dtype), embed_layer.weight)
+                    soft_emb_u = torch.where(loss_mask.unsqueeze(-1).expand_as(soft_emb_u), soft_emb_u, context_embeds)
+                    outputs_u = model(inputs_embeds=soft_emb_u, attention_mask=attention_mask)
+                    logits_u = outputs_u.logits
+                    del soft_emb_u, x_embed_u, outputs_u
+                    if eval_temp > 0:
+                        logits_u = logits_u / eval_temp
+                    probs_u = F.softmax(logits_u, dim=-1)
+                    del logits_u
+                    if use_expected_logmap:
+                        tangent_u = expected_logmap_to_onehots(x_perturb_u, probs_u) * step_weight
+                    else:
+                        x1_u = probs_u.sqrt()
+                        tangent_u = log_map(x_perturb_u, x1_u) * step_weight
+                    del probs_u
+                    v_norm_u = torch.norm(tangent_u, dim=-1, keepdim=True).clamp(min=1e-8)
+                    x_after_u = x_perturb_u * torch.cos(v_norm_u) + tangent_u * torch.sin(v_norm_u) / v_norm_u
+                    x_after_u = x_after_u / torch.norm(x_after_u, dim=-1, keepdim=True).clamp(min=1e-8)
+                    del tangent_u, v_norm_u
 
-                # Run one step on each perturbed state
-                # For x_perturb_u:
-                x_embed_u = x_perturb_u if self.embed_type == "spherical" else sphere_to_simplex(x_perturb_u)
-                soft_emb_u = torch.matmul(x_embed_u.to(embed_layer.weight.dtype), embed_layer.weight)
-                soft_emb_u = torch.where(loss_mask.unsqueeze(-1).expand_as(soft_emb_u), soft_emb_u, context_embeds)
-                outputs_u = model(inputs_embeds=soft_emb_u, attention_mask=attention_mask)
-                logits_u = outputs_u.logits
-                if eval_temp > 0:
-                    logits_u = logits_u / eval_temp
-                probs_u = F.softmax(logits_u, dim=-1)
-                if use_expected_logmap:
-                    tangent_u = expected_logmap_to_onehots(x_perturb_u, probs_u) * step_weight
+                    # Forward pass for g direction
+                    x_embed_g = x_perturb_g if self.embed_type == "spherical" else sphere_to_simplex(x_perturb_g)
+                    soft_emb_g = torch.matmul(x_embed_g.to(embed_layer.weight.dtype), embed_layer.weight)
+                    soft_emb_g = torch.where(loss_mask.unsqueeze(-1).expand_as(soft_emb_g), soft_emb_g, context_embeds)
+                    outputs_g = model(inputs_embeds=soft_emb_g, attention_mask=attention_mask)
+                    logits_g = outputs_g.logits
+                    del soft_emb_g, x_embed_g, outputs_g
+                    if eval_temp > 0:
+                        logits_g = logits_g / eval_temp
+                    probs_g = F.softmax(logits_g, dim=-1)
+                    del logits_g
+                    if use_expected_logmap:
+                        tangent_g = expected_logmap_to_onehots(x_perturb_g, probs_g) * step_weight
+                    else:
+                        x1_g = probs_g.sqrt()
+                        tangent_g = log_map(x_perturb_g, x1_g) * step_weight
+                    del probs_g
+                    v_norm_g = torch.norm(tangent_g, dim=-1, keepdim=True).clamp(min=1e-8)
+                    x_after_g = x_perturb_g * torch.cos(v_norm_g) + tangent_g * torch.sin(v_norm_g) / v_norm_g
+                    x_after_g = x_after_g / torch.norm(x_after_g, dim=-1, keepdim=True).clamp(min=1e-8)
+                    del tangent_g, v_norm_g
+
+                    # Compute contraction ratios
+                    d_before_u = torch.acos((x_sphere_before_step * x_perturb_u).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                    d_after_u = torch.acos((x_sphere * x_after_u).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                    rho_u = d_after_u / d_before_u.clamp(min=1e-8)
+                    mean_rho_u = (rho_u * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                    step_contraction_u.append(mean_rho_u.item())
+                    del x_perturb_u, x_after_u, d_before_u, d_after_u, rho_u
+
+                    d_before_g = torch.acos((x_sphere_before_step * x_perturb_g).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                    d_after_g = torch.acos((x_sphere * x_after_g).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
+                    rho_g = d_after_g / d_before_g.clamp(min=1e-8)
+                    mean_rho_g = (rho_g * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                    step_contraction_g.append(mean_rho_g.item())
+                    del x_perturb_g, x_after_g, d_before_g, d_after_g, rho_g
+
+                    # DIAGNOSTIC 3: Support-violation / OOD distance
+                    if self.schedule_type == "linear":
+                        alpha_t_curr = t_next
+                    else:
+                        alpha_t_curr = 1 - torch.cos(math.pi / 2 * t_next).square()
+
+                    top_k = 5
+                    _, top_k_indices = torch.topk(probs, top_k, dim=-1)
+                    min_distances = torch.full((b, l), float('inf'), device=device)
+
+                    for k_idx in range(top_k):
+                        token_k = top_k_indices[:, :, k_idx]
+                        onehot_k = F.one_hot(token_k, num_classes=vocab_size).float()
+                        sphere_k = simplex_to_sphere(onehot_k)
+                        m_t_k = geodesic_interpolant(prior_sample, sphere_k, alpha_t_curr)
+                        dot_xm = (x_sphere * m_t_k).sum(dim=-1)
+                        dist_to_m = torch.acos(dot_xm.clamp(-1+1e-7, 1-1e-7))
+                        min_distances = torch.minimum(min_distances, dist_to_m)
+                        del onehot_k, sphere_k, m_t_k
+                    del top_k_indices
+
+                    mean_ood_dist = (min_distances * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
+                    step_ood_distance.append(mean_ood_dist.item())
+                    del min_distances
                 else:
-                    x1_u = probs_u.sqrt()
-                    tangent_u = log_map(x_perturb_u, x1_u) * step_weight
-                v_norm_u = torch.norm(tangent_u, dim=-1, keepdim=True).clamp(min=1e-8)
-                x_after_u = x_perturb_u * torch.cos(v_norm_u) + tangent_u * torch.sin(v_norm_u) / v_norm_u
-                x_after_u = x_after_u / torch.norm(x_after_u, dim=-1, keepdim=True).clamp(min=1e-8)
+                    # Placeholders when expensive diagnostics disabled
+                    # Note: ΔL is computed above (FREE, no extra forward pass)
+                    step_contraction_u.append(0.0)
+                    step_contraction_g.append(0.0)
+                    step_ood_distance.append(0.0)
 
-                # For x_perturb_g:
-                x_embed_g = x_perturb_g if self.embed_type == "spherical" else sphere_to_simplex(x_perturb_g)
-                soft_emb_g = torch.matmul(x_embed_g.to(embed_layer.weight.dtype), embed_layer.weight)
-                soft_emb_g = torch.where(loss_mask.unsqueeze(-1).expand_as(soft_emb_g), soft_emb_g, context_embeds)
-                outputs_g = model(inputs_embeds=soft_emb_g, attention_mask=attention_mask)
-                logits_g = outputs_g.logits
-                if eval_temp > 0:
-                    logits_g = logits_g / eval_temp
-                probs_g = F.softmax(logits_g, dim=-1)
-                if use_expected_logmap:
-                    tangent_g = expected_logmap_to_onehots(x_perturb_g, probs_g) * step_weight
-                else:
-                    x1_g = probs_g.sqrt()
-                    tangent_g = log_map(x_perturb_g, x1_g) * step_weight
-                v_norm_g = torch.norm(tangent_g, dim=-1, keepdim=True).clamp(min=1e-8)
-                x_after_g = x_perturb_g * torch.cos(v_norm_g) + tangent_g * torch.sin(v_norm_g) / v_norm_g
-                x_after_g = x_after_g / torch.norm(x_after_g, dim=-1, keepdim=True).clamp(min=1e-8)
-
-                # Compute distances
-                # d(x, x_perturb_u) before step
-                d_before_u = torch.acos((x_sphere_before_step * x_perturb_u).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
-                # d(Phi(x), Phi(x_perturb_u)) after step
-                d_after_u = torch.acos((x_sphere * x_after_u).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
-                rho_u = d_after_u / d_before_u.clamp(min=1e-8)
-                mean_rho_u = (rho_u * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
-                step_contraction_u.append(mean_rho_u.item())
-
-                # Same for g direction
-                d_before_g = torch.acos((x_sphere_before_step * x_perturb_g).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
-                d_after_g = torch.acos((x_sphere * x_after_g).sum(dim=-1).clamp(-1+1e-7, 1-1e-7))
-                rho_g = d_after_g / d_before_g.clamp(min=1e-8)
-                mean_rho_g = (rho_g * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
-                step_contraction_g.append(mean_rho_g.item())
-
-                # ============================================================
-                # NEW DIAGNOSTIC 3: Support-violation / OOD distance
-                # Measure how far x_sphere is from the training manifold M_t
-                # M_t = {geodesic(x_0, e_k, alpha(t))} for k in top-K tokens
-                # residual r = min_k d(x, m_{t,k})
-                # ============================================================
-                # Get alpha(t) for current time
-                if self.schedule_type == "linear":
-                    alpha_t_curr = t_next
-                else:
-                    alpha_t_curr = 1 - torch.cos(math.pi / 2 * t_next).square()
-
-                # Get top-K tokens under the model (K=5)
-                top_k = 5
-                _, top_k_indices = torch.topk(probs, top_k, dim=-1)  # [b, l, K]
-
-                # For each position, compute distance to closest training manifold point
-                # m_{t,k} = geodesic(x_0, e_k, alpha(t)) where x_0 is the prior sample
-                min_distances = torch.full((b, l), float('inf'), device=device)
-
-                for k_idx in range(top_k):
-                    # Get the k-th top token indices
-                    token_k = top_k_indices[:, :, k_idx]  # [b, l]
-                    # Create one-hot for this token
-                    onehot_k = F.one_hot(token_k, num_classes=vocab_size).float()
-                    sphere_k = simplex_to_sphere(onehot_k)
-                    # Compute training manifold point: geodesic(prior_sample, sphere_k, alpha_t)
-                    # Use geodesic_interpolant
-                    m_t_k = geodesic_interpolant(prior_sample, sphere_k, alpha_t_curr)
-                    # Distance from x_sphere to m_t_k
-                    dot_xm = (x_sphere * m_t_k).sum(dim=-1)
-                    dist_to_m = torch.acos(dot_xm.clamp(-1+1e-7, 1-1e-7))
-                    min_distances = torch.minimum(min_distances, dist_to_m)
-
-                mean_ood_dist = (min_distances * loss_mask.float()).sum() / loss_mask.sum().clamp_min(1)
-                step_ood_distance.append(mean_ood_dist.item())
+                # Clean up tensors from this step
+                del x_sphere_before_step
 
         # ============================================================
         # NEW DIAGNOSTIC 4: Calibration (compute once at end, not per-step)
