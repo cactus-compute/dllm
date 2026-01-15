@@ -30,6 +30,7 @@ from .rdlm_utils import (
     RDLMPriorType,
     get_rdlm_prior,
     rdlm_interpolant,
+    expected_logmap_to_onehots,
     compute_target_drift,
 )
 
@@ -39,14 +40,25 @@ class BertRDLMTrainerConfig(TrainingArguments):
     """Configuration for BertRDLMTrainer."""
     # Prior configuration
     prior_type: str = "mixture"  # "uniform", "masked", or "mixture"
-    mixing_prob: float = 0.5    # For mixture prior
+    mixing_prob: float = 0.5    # Probability of uniform state in mixture prior
     mask_idx: int = -1          # Index of mask token (default: last)
+    add_mask_token: bool = True
+    init_lambda: Optional[float] = None
+    mix_type: str = "step"
+    mix_step_thr: float = 0.0
 
     # Schedule configuration (defaults match RDLM paper)
     schedule_type: str = "geometric"
     sigma_0: float = 0.001  # beta_0 in RDLM
     sigma_T: float = 0.2    # beta_f in RDLM (paper uses 0.2, not 1.0)
     n_time_steps: int = 10000  # preprocess_steps in RDLM paper
+    preprocess_dims: int = 2 ** 14
+    rho_scale: float = 1.0
+    weight_type: str = "step"
+    weight_left: float = 0.3
+    weight_right: float = 0.75
+    weight_lb: float = 1e-4
+    weight_ub: float = 1.0
 
     # Interpolation
     use_riemannian_normal: bool = True
@@ -98,6 +110,17 @@ class BertRDLMTrainer(transformers.Trainer):
         # Store RDLM config from args
         self.prior_type = args.prior_type
         self.mixing_prob = args.mixing_prob
+        self.add_mask_token = args.add_mask_token
+        self.init_lambda = args.init_lambda
+        self.mix_type = args.mix_type
+        self.mix_step_thr = args.mix_step_thr
+        self.preprocess_dims = args.preprocess_dims
+        self.rho_scale = args.rho_scale
+        self.weight_type = args.weight_type
+        self.weight_left = args.weight_left
+        self.weight_right = args.weight_right
+        self.weight_lb = args.weight_lb
+        self.weight_ub = args.weight_ub
         self.use_riemannian_normal = args.use_riemannian_normal
         self.loss_type = args.loss_type
         self.loss_norm_type = args.loss_norm_type
@@ -112,15 +135,17 @@ class BertRDLMTrainer(transformers.Trainer):
         # Get vocab size from model
         unwrapped_model = model.module if hasattr(model, 'module') else model
         if hasattr(unwrapped_model.config, 'vocab_size'):
-            self.vocab_size = unwrapped_model.config.vocab_size
+            self.model_vocab_size = unwrapped_model.config.vocab_size
         else:
-            self.vocab_size = kwargs.get('vocab_size', 30522)
+            self.model_vocab_size = kwargs.get('vocab_size', 30522)
+        self.vocab_size = self.model_vocab_size
+        self.rdlm_vocab_size = self.model_vocab_size + (1 if self.add_mask_token else 0)
 
         # Set mask index
-        if args.mask_idx == -1:
-            self.mask_idx = self.vocab_size - 1
+        if self.add_mask_token:
+            self.mask_idx = self.rdlm_vocab_size - 1
         else:
-            self.mask_idx = args.mask_idx
+            self.mask_idx = args.mask_idx if args.mask_idx != -1 else self.model_vocab_size - 1
 
         # Initialize RDLM schedule with precomputed values
         # Note: We defer device placement until first compute_loss call
@@ -131,6 +156,17 @@ class BertRDLMTrainer(transformers.Trainer):
             sigma_T=args.sigma_T,
             n_time_steps=args.n_time_steps,
             prior_type=args.prior_type,
+            add_mask_token=self.add_mask_token,
+            init_lambda=self.init_lambda,
+            mix_type=self.mix_type,
+            mix_step_thr=self.mix_step_thr,
+            rho_scale=self.rho_scale,
+            preprocess_dims=self.preprocess_dims,
+            weight_type=self.weight_type,
+            weight_left=self.weight_left,
+            weight_right=self.weight_right,
+            weight_lb=self.weight_lb,
+            weight_ub=self.weight_ub,
         )
 
         # Time embedding (initialized lazily)
@@ -150,7 +186,8 @@ class BertRDLMTrainer(transformers.Trainer):
             self.rdlm_schedule = RDLMSchedule(
                 config=self.schedule_config,
                 device=device,
-                precompute=True
+                precompute=True,
+                manifold_dim=self.rdlm_vocab_size - 1,
             )
         elif self.rdlm_schedule.device != device:
             self.rdlm_schedule = self.rdlm_schedule.to(device)
@@ -181,7 +218,11 @@ class BertRDLMTrainer(transformers.Trainer):
             dtype=dtype,
             t=t,
             mask_idx=self.mask_idx,
-            mixing_prob=self.mixing_prob
+            mixing_prob=self.mixing_prob,
+            mix_type=self.mix_type,
+            mix_step_thr=self.mix_step_thr,
+            init_lambda=self.init_lambda,
+            add_mask_token=self.add_mask_token,
         )
 
     def interpolate(
@@ -202,17 +243,13 @@ class BertRDLMTrainer(transformers.Trainer):
             xt: [B, L, D] interpolated samples on sphere
         """
         if self.use_riemannian_normal:
-            # Get precomputed α_t and ρ_t
-            alpha_t, rho_t = self.rdlm_schedule.get_alpha_rho(t)
-
             return rdlm_interpolant(
                 x0=x0,
                 target_indices=target_indices,
                 t=t,
-                alpha_t=alpha_t,
-                rho_t=rho_t,
-                vocab_size=self.vocab_size,
-                add_noise=True
+                schedule=self.rdlm_schedule,
+                mask_idx=self.mask_idx,
+                add_noise=True,
             )
         else:
             # Fall back to geodesic interpolation
@@ -269,12 +306,16 @@ class BertRDLMTrainer(transformers.Trainer):
             embed_layer = unwrapped_model.model.embed_tokens
         compute_dtype = embed_layer.weight.dtype
 
-        # Sample time uniformly in (eps, 1-eps)
+        # Sample time (importance-weighted for RDLM, uniform otherwise)
         eps = self.time_eps
-        t = eps + (1 - 2 * eps) * torch.rand(B, device=device)
+        if model.training and self.rdlm_schedule.weight_type != "default":
+            t = self.rdlm_schedule.importance_weighted_time((B,), device)
+            t = t.clamp(max=1 - eps)
+        else:
+            t = (1 - eps) * torch.rand(B, device=device)
 
         # Sample from prior
-        x0 = self.get_prior_samples((B, L, self.vocab_size), device, compute_dtype, t)
+        x0 = self.get_prior_samples((B, L, self.rdlm_vocab_size), device, compute_dtype, t)
 
         # Get interpolated samples
         xt = self.interpolate(x0, input_ids, t)
@@ -289,6 +330,8 @@ class BertRDLMTrainer(transformers.Trainer):
 
         # Compute soft embeddings
         x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
+        if x_embed.shape[-1] > self.model_vocab_size:
+            x_embed = x_embed[..., : self.model_vocab_size]
         soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
         if x_embed is not xt:
             del x_embed  # Free if we created a new tensor
@@ -312,7 +355,8 @@ class BertRDLMTrainer(transformers.Trainer):
         )
         del soft_embeddings  # Free memory before logits allocation
         logits = outputs.logits  # [B, L, V]
-        del outputs
+        if not return_outputs:
+            del outputs
 
         # Compute loss based on loss type
         if self.loss_type == "ce":
@@ -324,16 +368,31 @@ class BertRDLMTrainer(transformers.Trainer):
             )
 
         elif self.loss_type == "mse":
-            # MSE drift matching loss
-            gamma_t = self.rdlm_schedule.get_gamma(t)
-            target_drift = compute_target_drift(xt, input_ids, gamma_t, self.vocab_size)
+            # MSE drift matching loss (ELBO)
+            drift_coeff = self.rdlm_schedule.get_gamma(t)
+            target_drift = compute_target_drift(xt, input_ids, drift_coeff, self.rdlm_vocab_size)
 
-            # Project model output to tangent space
-            predicted_drift = make_tangent(xt, logits)
-            token_loss = (predicted_drift - target_drift).square().sum(dim=-1)  # [B, L]
+            probs = F.softmax(logits.to(torch.float32), dim=-1)
+            if probs.shape[-1] < xt.shape[-1]:
+                pad = xt.shape[-1] - probs.shape[-1]
+                probs = torch.cat([probs, probs.new_zeros(*probs.shape[:-1], pad)], dim=-1)
+
+            predicted_drift = expected_logmap_to_onehots(xt, probs, positive_orthant=False)
+            predicted_drift = predicted_drift * drift_coeff.view(-1, 1, 1)
+            predicted_drift = make_tangent(xt, predicted_drift)
+
+            diff = predicted_drift - target_drift
+            token_loss = 0.5 * diff.square().sum(dim=-1)
+
+            beta_t = self.rdlm_schedule.get_sigma(t)
+            token_loss = token_loss / beta_t.view(-1, 1).clamp(min=1e-8)
 
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        # Importance weight for RDLM
+        weight = self.rdlm_schedule.importance_weight(t, model.training).view(B, 1)
+        token_loss = token_loss * weight
 
         # Update metrics with raw loss (before masking)
         self.meter.update(
@@ -380,7 +439,8 @@ class BertRDLMTrainer(transformers.Trainer):
 
         B, L = input_ids.shape
         unwrapped_model = model.module if hasattr(model, 'module') else model
-        vocab_size = unwrapped_model.config.vocab_size
+        model_vocab_size = unwrapped_model.config.vocab_size
+        rdlm_vocab_size = self.rdlm_vocab_size
         device = input_ids.device
 
         # Get the actual model device (may differ from input device due to HF Trainer)
@@ -408,10 +468,10 @@ class BertRDLMTrainer(transformers.Trainer):
         if self.eval_simple:
             # Simple eval: single forward pass at random t (matches training)
             eps = self.time_eps
-            t = eps + (1 - 2 * eps) * torch.rand(B, device=device)
+            t = (1 - eps) * torch.rand(B, device=device)
 
             # Sample from prior
-            x0 = self.get_prior_samples((B, L, vocab_size), device, compute_dtype, t)
+            x0 = self.get_prior_samples((B, L, rdlm_vocab_size), device, compute_dtype, t)
 
             # Get interpolated samples
             xt = self.interpolate(x0, input_ids, t)
@@ -425,6 +485,8 @@ class BertRDLMTrainer(transformers.Trainer):
 
             # Compute soft embeddings
             x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
+            if x_embed.shape[-1] > model_vocab_size:
+                x_embed = x_embed[..., :model_vocab_size]
             soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
 
             # Add time embedding if enabled
@@ -452,12 +514,12 @@ class BertRDLMTrainer(transformers.Trainer):
             from dllm.pipelines.bert_rdlm.sampler import BertRDLMSampler, BertRDLMSamplerConfig
 
             # Initialize sphere state
-            prompt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
+            prompt_onehot = F.one_hot(input_ids, num_classes=rdlm_vocab_size).float()
             x_sphere = simplex_to_sphere(prompt_onehot)
 
             # For flow positions: sample from RDLM prior
             prior_sample = self.get_prior_samples(
-                (B, L, vocab_size), device, compute_dtype
+                (B, L, rdlm_vocab_size), device, compute_dtype, t=torch.zeros(B, device=device)
             )
             x_sphere = torch.where(
                 loss_mask.unsqueeze(-1).expand_as(x_sphere),
@@ -478,12 +540,17 @@ class BertRDLMTrainer(transformers.Trainer):
                 n_steps=self.eval_integration_steps,
                 integrator="euler",
                 prior_type=self.prior_type,
+                mixing_prob=self.mixing_prob,
+                mask_idx=self.mask_idx,
+                add_mask_token=self.add_mask_token,
                 schedule_type=self.schedule_config.schedule_type,
                 sigma_0=self.schedule_config.sigma_0,
                 sigma_T=self.schedule_config.sigma_T,
                 temperature=0.0,
                 embed_type=self.embed_type,
                 stochastic=self.eval_stochastic,
+                mix_type=self.mix_type,
+                mix_step_thr=self.mix_step_thr,
             )
 
             # Run flow integration
@@ -498,6 +565,8 @@ class BertRDLMTrainer(transformers.Trainer):
 
             # Compute final loss
             final_probs = sphere_to_simplex(x_sphere)
+            if final_probs.shape[-1] > model_vocab_size:
+                final_probs = final_probs[..., :model_vocab_size]
             final_log_probs = torch.log(final_probs.clamp(min=1e-10))
 
             token_loss = F.nll_loss(

@@ -31,8 +31,7 @@ from .rdlm_utils import (
     geometric_schedule,
     linear_schedule,
     cosine_schedule,
-    bridge_gamma,
-    expected_drift_from_probs,
+    drift_coeff,
 )
 
 
@@ -45,8 +44,11 @@ class BertRDLMSamplerConfig(SamplerConfig):
 
     # Prior
     prior_type: str = "mixture"  # "uniform", "masked", "mixture"
-    mixing_prob: float = 0.5
+    mixing_prob: float = 0.5  # Probability of uniform state in mixture prior
     mask_idx: int = -1
+    add_mask_token: bool = True
+    mix_type: str = "step"
+    mix_step_thr: float = 0.0
 
     # Schedule (defaults match RDLM paper)
     schedule_type: str = "geometric"  # "geometric", "linear", "cosine"
@@ -65,6 +67,9 @@ class BertRDLMSamplerConfig(SamplerConfig):
 
     # Whether to add stochastic noise during sampling (RDLM uses grw/Euler-Maruyama)
     stochastic: bool = True
+
+    # Sampling eps (avoid t=1)
+    sampling_eps: float = 1e-5
 
 
 @dataclass
@@ -122,6 +127,8 @@ class BertRDLMSampler(BaseSampler):
         """
         # Compute soft embeddings
         x_embed = x_sphere if config.embed_type == "spherical" else sphere_to_simplex(x_sphere)
+        if x_embed.shape[-1] > embed_layer.weight.shape[0]:
+            x_embed = x_embed[..., : embed_layer.weight.shape[0]]
         soft_embeddings = torch.matmul(
             x_embed.to(embed_layer.weight.dtype), embed_layer.weight
         )
@@ -152,11 +159,18 @@ class BertRDLMSampler(BaseSampler):
             # Model predicts distribution over endpoints (tokens)
             # Compute expected log-map toward one-hots weighted by probabilities
             # This matches RDLM's weighted_sum operation
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits.to(torch.float32), dim=-1)
+            if probs.shape[-1] < x_sphere.shape[-1]:
+                pad = x_sphere.shape[-1] - probs.shape[-1]
+                probs = torch.cat([probs, probs.new_zeros(*probs.shape[:-1], pad)], dim=-1)
             # Use positive_orthant=False to handle full sphere (RDLM style)
             tangent = expected_logmap_to_onehots(x_sphere, probs, positive_orthant=False)
         elif config.prediction_type == "drift":
-            tangent = make_tangent(x_sphere, logits)
+            drift = logits
+            if drift.shape[-1] < x_sphere.shape[-1]:
+                pad = x_sphere.shape[-1] - drift.shape[-1]
+                drift = torch.cat([drift, drift.new_zeros(*drift.shape[:-1], pad)], dim=-1)
+            tangent = make_tangent(x_sphere, drift)
         else:
             raise ValueError(f"Unknown prediction_type: {config.prediction_type}")
 
@@ -195,18 +209,23 @@ class BertRDLMSampler(BaseSampler):
 
         device = x_sphere.device
         n_steps = config.n_steps
-        dt = 1.0 / n_steps
+        eps = config.sampling_eps
+        timesteps = torch.linspace(0.0, 1.0 - eps, n_steps + 1, device=device)
+        dt = (1.0 - eps) / n_steps
 
         sigma_fn = self._get_sigma_fn(config)
 
         histories = [] if return_histories else None
+        model_vocab_size = embed_layer.weight.shape[0]
         if return_histories:
-            histories.append(sphere_to_simplex(x_sphere).argmax(dim=-1).clone())
+            hist_probs = sphere_to_simplex(x_sphere)
+            if hist_probs.shape[-1] > model_vocab_size:
+                hist_probs = hist_probs[..., :model_vocab_size]
+            histories.append(hist_probs.argmax(dim=-1).clone())
 
         # Integration loop
         for step in range(n_steps):
-            t = step * dt
-            t_tensor = torch.tensor(t, device=device)
+            t_tensor = timesteps[step]
 
             # Compute tangent direction
             tangent = self._compute_tangent(
@@ -219,14 +238,8 @@ class BertRDLMSampler(BaseSampler):
             # - Geometric with sigma_0 == sigma_T: drift_coeff = 1 / (1-t)
             # - Geometric with sigma_0 != sigma_T: drift_coeff = log(r) / (r^(1-t) - 1)
             if config.prediction_type == "endpoint":
-                if abs(config.sigma_0 - config.sigma_T) < 1e-8:
-                    # Constant sigma case
-                    drift_coeff = 1.0 / max(1 - t, 1e-4)
-                else:
-                    # General geometric case
-                    r = config.sigma_T / config.sigma_0
-                    drift_coeff = math.log(r) / max(r ** (1 - t) - 1, 1e-8)
-                tangent = tangent * drift_coeff
+                coeff = drift_coeff(t_tensor, config.schedule_type, config.sigma_0, config.sigma_T)
+                tangent = tangent * coeff
                 # CRITICAL: RDLM applies to_tangent AFTER scaling by drift coefficient
                 # This ensures the drift stays on the tangent plane after scaling
                 tangent = make_tangent(x_sphere, tangent)
@@ -262,7 +275,10 @@ class BertRDLMSampler(BaseSampler):
             )
 
             if return_histories:
-                histories.append(sphere_to_simplex(x_sphere).argmax(dim=-1).clone())
+                hist_probs = sphere_to_simplex(x_sphere)
+                if hist_probs.shape[-1] > model_vocab_size:
+                    hist_probs = hist_probs[..., :model_vocab_size]
+                histories.append(hist_probs.argmax(dim=-1).clone())
 
         if return_histories:
             return x_sphere, histories
@@ -300,7 +316,7 @@ class BertRDLMSampler(BaseSampler):
         # Setup
         unwrapped_model = self.model.module if hasattr(self.model, "module") else self.model
         device = next(unwrapped_model.parameters()).device
-        vocab_size = unwrapped_model.config.vocab_size
+        model_vocab_size = unwrapped_model.config.vocab_size
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 
         # Convert inputs to tensors
@@ -332,17 +348,21 @@ class BertRDLMSampler(BaseSampler):
         else:
             embed_layer = self.model.model.embed_tokens
         compute_dtype = embed_layer.weight.dtype
+        rdlm_vocab_size = model_vocab_size + (1 if config.add_mask_token else 0)
 
         # Determine mask index
-        mask_idx = config.mask_idx if config.mask_idx != -1 else vocab_size - 1
+        if config.add_mask_token:
+            mask_idx = rdlm_vocab_size - 1
+        else:
+            mask_idx = config.mask_idx if config.mask_idx != -1 else model_vocab_size - 1
 
         # Initialize sphere state
         # Prompt positions: one-hot on sphere
-        prompt_onehot = F.one_hot(x_ids, num_classes=vocab_size).float()
+        prompt_onehot = F.one_hot(x_ids, num_classes=rdlm_vocab_size).float()
         x_sphere = simplex_to_sphere(prompt_onehot)
 
         # Generation positions: sample from prior
-        gen_shape = (B, max_new_tokens, vocab_size)
+        gen_shape = (B, max_new_tokens, rdlm_vocab_size)
         gen_prior = get_rdlm_prior(
             prior_type=config.prior_type,
             shape=gen_shape,
@@ -350,6 +370,10 @@ class BertRDLMSampler(BaseSampler):
             dtype=compute_dtype,
             mask_idx=mask_idx,
             mixing_prob=config.mixing_prob,
+            mix_type=config.mix_type,
+            mix_step_thr=config.mix_step_thr,
+            add_mask_token=config.add_mask_token,
+            t=torch.zeros(B, device=device),
         )
         for i, pl in enumerate(prompt_lens):
             x_sphere[i, pl:pl + max_new_tokens] = gen_prior[i]
@@ -364,6 +388,9 @@ class BertRDLMSampler(BaseSampler):
             prior_type=config.prior_type,
             mixing_prob=config.mixing_prob,
             mask_idx=mask_idx,
+            add_mask_token=config.add_mask_token,
+            mix_type=config.mix_type,
+            mix_step_thr=config.mix_step_thr,
             schedule_type=config.schedule_type,
             sigma_0=config.sigma_0,
             sigma_T=config.sigma_T,
@@ -371,6 +398,7 @@ class BertRDLMSampler(BaseSampler):
             prediction_type=config.prediction_type,
             embed_type=config.embed_type,
             stochastic=config.stochastic,
+            sampling_eps=config.sampling_eps,
         )
 
         # Run flow integration
@@ -392,6 +420,8 @@ class BertRDLMSampler(BaseSampler):
 
         # Convert to tokens
         final_probs = sphere_to_simplex(x_sphere)
+        if final_probs.shape[-1] > model_vocab_size:
+            final_probs = final_probs[..., :model_vocab_size]
         final_tokens = final_probs.argmax(dim=-1)
 
         # Merge prompt with generated tokens
@@ -433,7 +463,7 @@ class BertRDLMSampler(BaseSampler):
         # Setup
         unwrapped_model = self.model.module if hasattr(self.model, "module") else self.model
         device = next(unwrapped_model.parameters()).device
-        vocab_size = unwrapped_model.config.vocab_size
+        model_vocab_size = unwrapped_model.config.vocab_size
         mask_id = self.tokenizer.mask_token_id
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
 
@@ -464,24 +494,32 @@ class BertRDLMSampler(BaseSampler):
         else:
             embed_layer = self.model.model.embed_tokens
         compute_dtype = embed_layer.weight.dtype
+        rdlm_vocab_size = model_vocab_size + (1 if config.add_mask_token else 0)
 
         # Determine mask index
-        mask_idx = config.mask_idx if config.mask_idx != -1 else vocab_size - 1
+        if config.add_mask_token:
+            mask_idx = rdlm_vocab_size - 1
+        else:
+            mask_idx = config.mask_idx if config.mask_idx != -1 else model_vocab_size - 1
 
         # Initialize sphere state
         # Non-masked positions: one-hot on sphere
         non_mask_ids = torch.where(mask_positions, torch.zeros_like(x_ids), x_ids)
-        non_mask_onehot = F.one_hot(non_mask_ids, num_classes=vocab_size).float()
+        non_mask_onehot = F.one_hot(non_mask_ids, num_classes=rdlm_vocab_size).float()
         x_sphere = simplex_to_sphere(non_mask_onehot)
 
         # Masked positions: sample from prior
         prior_sample = get_rdlm_prior(
             prior_type=config.prior_type,
-            shape=(B, T, vocab_size),
+            shape=(B, T, rdlm_vocab_size),
             device=device,
             dtype=compute_dtype,
             mask_idx=mask_idx,
             mixing_prob=config.mixing_prob,
+            mix_type=config.mix_type,
+            mix_step_thr=config.mix_step_thr,
+            add_mask_token=config.add_mask_token,
+            t=torch.zeros(B, device=device),
         )
         x_sphere = torch.where(
             mask_positions.unsqueeze(-1).expand_as(x_sphere),
@@ -499,6 +537,9 @@ class BertRDLMSampler(BaseSampler):
             prior_type=config.prior_type,
             mixing_prob=config.mixing_prob,
             mask_idx=mask_idx,
+            add_mask_token=config.add_mask_token,
+            mix_type=config.mix_type,
+            mix_step_thr=config.mix_step_thr,
             schedule_type=config.schedule_type,
             sigma_0=config.sigma_0,
             sigma_T=config.sigma_T,
@@ -506,6 +547,7 @@ class BertRDLMSampler(BaseSampler):
             prediction_type=config.prediction_type,
             embed_type=config.embed_type,
             stochastic=config.stochastic,
+            sampling_eps=config.sampling_eps,
         )
 
         # Run flow integration
@@ -527,6 +569,8 @@ class BertRDLMSampler(BaseSampler):
 
         # Convert to tokens
         final_probs = sphere_to_simplex(x_sphere)
+        if final_probs.shape[-1] > model_vocab_size:
+            final_probs = final_probs[..., :model_vocab_size]
         final_tokens = final_probs.argmax(dim=-1)
 
         # Merge

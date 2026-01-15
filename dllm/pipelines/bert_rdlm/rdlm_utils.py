@@ -8,6 +8,8 @@ This module provides:
 - Bridge process drift computation
 """
 
+import abc
+import math
 import os
 import torch
 import torch.nn as nn
@@ -33,7 +35,91 @@ from dllm.pipelines.bert_sfm.geodesic_utils import (
     sphere_to_simplex,
     uniform_prior,
     geodesic_interpolant,
+    expected_logmap_to_onehots,
 )
+
+
+# =============================================================================
+# Weighting utilities (matches rdlm/utils/weight_utils.py)
+# =============================================================================
+
+_WEIGHT_FN = {}
+
+
+def register_weight_fn(cls=None, *, name=None):
+    """Decorator for registering weight functions."""
+    def _register(cls):
+        local_name = cls.__name__ if name is None else name
+        if local_name in _WEIGHT_FN:
+            raise ValueError(f"Already registered weight fn with name: {local_name}")
+        _WEIGHT_FN[local_name] = cls
+        return cls
+
+    return _register(cls) if cls is not None else _register
+
+
+def get_weight_fn(name):
+    return _WEIGHT_FN[name]
+
+
+class SchedulerWeight(abc.ABC, nn.Module):
+    @abc.abstractmethod
+    def forward(self, t):
+        pass
+
+    @abc.abstractmethod
+    def cum_weight_fn(self, t):
+        pass
+
+    @property
+    def norm_const(self):
+        return self.cum_weight_fn(1)
+
+
+@register_weight_fn(name="default")
+class DefaultWeight(SchedulerWeight):
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    def forward(self, t):
+        return torch.ones_like(t)
+
+    def cum_weight_fn(self, t):
+        return t
+
+
+@register_weight_fn(name="step")
+class StepWeight(SchedulerWeight):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.left = kwargs.get("left", 0.3)
+        self.right = kwargs.get("right", 0.6)
+        self.ub = kwargs.get("ub", 1.0)
+        self.lb = kwargs.get("lb", 1e-4)
+
+    def forward(self, t):
+        return torch.where(
+            (t > self.left) & (t < self.right),
+            torch.ones_like(t) * self.ub,
+            torch.ones_like(t) * self.lb,
+        )
+
+    def cum_weight_fn(self, t):
+        if isinstance(t, torch.Tensor):
+            return torch.where(
+                t < self.left,
+                t * self.lb,
+                torch.where(
+                    t > self.right,
+                    self.left * self.lb + (self.right - self.left) * self.ub + (t - self.right) * self.lb,
+                    self.left * self.lb + (t - self.left) * self.ub,
+                ),
+            )
+        if t < self.left:
+            return t * self.lb
+        if t > self.right:
+            return self.left * self.lb + (self.right - self.left) * self.ub + (t - self.right) * self.lb
+        return self.left * self.lb + (t - self.left) * self.ub
 
 
 # =============================================================================
@@ -45,6 +131,64 @@ class RDLMPriorType:
     UNIFORM = "uniform"
     MASKED = "masked"
     MIXTURE = "mixture"
+
+
+def _resolve_mask_idx(mask_idx: int, vocab_dim: int) -> int:
+    return mask_idx if mask_idx >= 0 else vocab_dim + mask_idx
+
+
+def mixture_prob_schedule(t: torch.Tensor, mix_type: str, step_thr: float = 0.0) -> torch.Tensor:
+    """RDLM mixture schedule: returns probability of uniform state."""
+    if mix_type == "linear":
+        return 1 - t
+    if mix_type == "sqrt":
+        return 1 - t.sqrt()
+    if "step" in mix_type:
+        return torch.where(t < step_thr, torch.ones_like(t), torch.zeros_like(t))
+    raise ValueError(f"Invalid mix_type: {mix_type}")
+
+
+def uniform_barycenter_prior(
+    shape: Tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Deterministic barycenter on the sphere: 1 / sqrt(D) in each dimension."""
+    scale = 1.0 / math.sqrt(shape[-1])
+    return torch.full(shape, scale, device=device, dtype=dtype)
+
+
+def init_uniform_prior(
+    shape: Tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    mask_idx: int = -1,
+) -> torch.Tensor:
+    """Uniform prior for Init path: uniform over token dims, zero on mask dim."""
+    vocab_dim = shape[-1]
+    mask_idx = _resolve_mask_idx(mask_idx, vocab_dim)
+    x0 = torch.ones(shape, device=device, dtype=dtype)
+    x0[..., mask_idx] = 0.0
+    return x0 / x0.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def initial_prior(
+    shape: Tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    rlambda: float = 1.0,
+    mask_idx: int = -1,
+) -> torch.Tensor:
+    """Initial distribution for LogBridge_Init (distribution.Initial)."""
+    vocab_dim = shape[-1]
+    mask_idx = _resolve_mask_idx(mask_idx, vocab_dim)
+    token_size = vocab_dim - 1
+    if token_size <= 0:
+        return uniform_barycenter_prior(shape, device, dtype)
+    init_val = math.sqrt(rlambda / token_size) if rlambda > 0 else 0.0
+    x0 = torch.full(shape, init_val, device=device, dtype=dtype)
+    x0[..., mask_idx] = math.sqrt(max(1.0 - rlambda, 0.0))
+    return x0
 
 
 def masked_prior(
@@ -82,14 +226,14 @@ def mixture_prior(
     """
     Sample from mixture prior: Bernoulli mixture of masked and uniform.
 
-    With probability λ, sample masked state e_m.
-    With probability (1-λ), sample uniform on positive orthant.
+    With probability mixing_prob, sample uniform barycenter.
+    With probability (1-mixing_prob), sample masked state e_m.
 
     Args:
         shape: (batch_size, seq_len, vocab_size)
         device: torch device
         dtype: tensor dtype
-        mixing_prob: probability of selecting masked state (λ)
+        mixing_prob: probability of selecting uniform state
         mask_idx: index of mask token
 
     Returns:
@@ -97,18 +241,18 @@ def mixture_prior(
     """
     B, L, D = shape
 
-    # Bernoulli mask: True = use masked state
-    use_mask = torch.rand(B, L, 1, device=device) < mixing_prob
+    # Bernoulli mask: True = use uniform state (per batch, broadcast across tokens)
+    use_uniform = torch.rand(B, 1, 1, device=device) < mixing_prob
 
     # Masked samples (one-hot at mask_idx)
     masked = torch.zeros(shape, device=device, dtype=dtype)
     masked[..., mask_idx] = 1.0
 
-    # Uniform samples on positive orthant of sphere
-    uniform = uniform_prior(shape, device, dtype)
+    # Uniform barycenter on sphere
+    uniform = uniform_barycenter_prior(shape, device, dtype)
 
     # Mix according to Bernoulli
-    x0 = torch.where(use_mask, masked, uniform)
+    x0 = torch.where(use_uniform, uniform, masked)
 
     return x0
 
@@ -121,7 +265,11 @@ def get_rdlm_prior(
     t: Optional[torch.Tensor] = None,
     mask_idx: int = -1,
     mixing_prob: float = 0.5,
-    lambda_fn: Optional[Callable] = None
+    lambda_fn: Optional[Callable] = None,
+    mix_type: Optional[str] = None,
+    mix_step_thr: float = 0.0,
+    init_lambda: Optional[float] = None,
+    add_mask_token: bool = False,
 ) -> torch.Tensor:
     """
     Get prior samples based on RDLM prior type.
@@ -133,30 +281,45 @@ def get_rdlm_prior(
         dtype: tensor dtype
         t: [B] time values (for time-dependent mixture)
         mask_idx: index of mask token
-        mixing_prob: mixing probability for mixture prior
-        lambda_fn: function t -> λ_t for time-dependent mixture
+        mixing_prob: probability of selecting uniform state in mixture
+        lambda_fn: function t -> lambda_t for time-dependent mixture
+        mix_type: mix schedule name (linear/sqrt/step)
+        mix_step_thr: step threshold for step schedule
+        init_lambda: rlambda for LogBridge_Init (None -> infer from prior_type)
+        add_mask_token: whether to treat mask as extra dimension
 
     Returns:
         x0: [B, L, D] prior samples on hypersphere
     """
     if prior_type == RDLMPriorType.UNIFORM:
-        return uniform_prior(shape, device, dtype)
+        if add_mask_token:
+            if init_lambda is None:
+                init_lambda = 1.0
+            return initial_prior(shape, device, dtype, rlambda=init_lambda, mask_idx=mask_idx)
+        return uniform_barycenter_prior(shape, device, dtype)
 
     elif prior_type == RDLMPriorType.MASKED:
+        if add_mask_token and init_lambda is not None and init_lambda != 0.0:
+            return initial_prior(shape, device, dtype, rlambda=init_lambda, mask_idx=mask_idx)
         return masked_prior(shape, device, dtype, mask_idx)
 
     elif prior_type == RDLMPriorType.MIXTURE:
-        if t is not None and lambda_fn is not None:
-            # Time-dependent mixing probability
-            B, L, D = shape
-            lambda_t = lambda_fn(t)  # [B]
-            use_mask = torch.rand(B, L, 1, device=device) < lambda_t.view(B, 1, 1)
-            masked = torch.zeros(shape, device=device, dtype=dtype)
-            masked[..., mask_idx] = 1.0
-            uniform = uniform_prior(shape, device, dtype)
-            return torch.where(use_mask, masked, uniform)
+        if t is None:
+            t = torch.zeros(shape[0], device=device)
+        if mix_type is not None:
+            uniform_prob = mixture_prob_schedule(t, mix_type, step_thr=mix_step_thr)
+        elif lambda_fn is not None:
+            uniform_prob = lambda_fn(t)
         else:
-            return mixture_prior(shape, device, dtype, mixing_prob, mask_idx)
+            uniform_prob = torch.full_like(t, mixing_prob)
+        # Sample mixture (uniform vs mask) per batch (broadcast across tokens)
+        B, L, _ = shape
+        uniform_prob = uniform_prob.view(B, 1, 1)
+        use_uniform = torch.rand(B, 1, 1, device=device) < uniform_prob
+        masked = torch.zeros(shape, device=device, dtype=dtype)
+        masked[..., mask_idx] = 1.0
+        uniform = uniform_barycenter_prior(shape, device, dtype)
+        return torch.where(use_uniform, uniform, masked)
 
     else:
         raise ValueError(f"Unknown prior type: {prior_type}")
@@ -201,97 +364,353 @@ def cosine_schedule(
     sigma_0: float = 0.001,
     sigma_T: float = 1.0
 ) -> torch.Tensor:
-    """Cosine noise schedule."""
-    import math
-    return sigma_0 + (sigma_T - sigma_0) * (1 - torch.cos(t * math.pi / 2))
+    """Cosine noise schedule (matches rdlm/scheduler_lib.py)."""
+    cos_t = torch.cos(math.pi / 2 * (1 - t))
+    return sigma_0 * (1 - cos_t) + sigma_T * cos_t
+
+
+def int_beta(
+    t: torch.Tensor,
+    schedule_type: str,
+    sigma_0: float,
+    sigma_T: float,
+) -> torch.Tensor:
+    """Integral of beta from t to T for the chosen schedule."""
+    if schedule_type == "geometric":
+        if sigma_0 == sigma_T:
+            return sigma_0 * (1 - t)
+        r = sigma_T / sigma_0
+        return sigma_0 * (r - r ** t) / math.log(r)
+    if schedule_type == "linear":
+        beta = sigma_T - sigma_0
+        return (1 - t) * (sigma_0 + 0.5 * (1 + t) * beta)
+    if schedule_type == "cosine":
+        beta = sigma_T - sigma_0
+        return sigma_0 * (1 - t) + 2 / math.pi * beta * torch.sin(math.pi / 2 * (1 - t))
+    raise ValueError(f"Unknown schedule type: {schedule_type}")
+
+
+def drift_coeff(
+    t: torch.Tensor,
+    schedule_type: str,
+    sigma_0: float,
+    sigma_T: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Bridge drift coefficient gamma_t = beta_t / int_beta(t)."""
+    if schedule_type == "geometric":
+        if sigma_0 == sigma_T:
+            return 1.0 / (1 - t).clamp(min=eps)
+        r = sigma_T / sigma_0
+        return math.log(r) / (r ** (1 - t) - 1).clamp(min=eps)
+    if schedule_type == "linear":
+        rbeta = sigma_0 / sigma_T if sigma_T > 0 else sigma_0 / max(sigma_0, eps)
+        numer = (1 - t) * rbeta + t
+        denom = (1 - t) * (rbeta + 0.5 * (1 + t) * (1 - rbeta))
+        return numer / denom.clamp(min=eps)
+    if schedule_type == "cosine":
+        beta_t = cosine_schedule(t, sigma_0, sigma_T)
+        return beta_t / int_beta(t, schedule_type, sigma_0, sigma_T).clamp(min=eps)
+    raise ValueError(f"Unknown schedule type: {schedule_type}")
 
 
 def bridge_gamma(
     t: torch.Tensor,
-    sigma_t: torch.Tensor,
-    eps: float = 1e-4
+    sigma_t: Optional[torch.Tensor] = None,
+    sigma_0: Optional[float] = None,
+    sigma_T: Optional[float] = None,
+    schedule_type: str = "geometric",
+    eps: float = 1e-4,
 ) -> torch.Tensor:
     """
-    Bridge drift coefficient: γ_t = σ_t² / (1 - t)
+    Bridge drift coefficient helper.
 
-    Args:
-        t: [B] time in [0, 1)
-        sigma_t: [B] noise level at time t
-        eps: small value to prevent division by zero
-
-    Returns:
-        gamma_t: [B] drift coefficient
+    If sigma_0 and sigma_T are provided, returns drift_coeff for the schedule.
+    Otherwise falls back to the legacy sigma_t^2 / (1 - t) form.
     """
+    if sigma_0 is not None and sigma_T is not None:
+        return drift_coeff(t, schedule_type, sigma_0, sigma_T, eps=eps)
+    if sigma_t is None:
+        raise ValueError("bridge_gamma requires sigma_t or (sigma_0, sigma_T).")
     return sigma_t ** 2 / (1 - t).clamp(min=eps)
 
 
 # =============================================================================
-# Precomputation of α_t and ρ_t
+# Precomputation of alpha_t and rho_t
 # =============================================================================
 
+def _coord_laplacian(x: torch.Tensor, t: torch.Tensor, scheduler, manifold_dim: int) -> torch.Tensor:
+    """Laplacian term in radial process."""
+    laplacian_coeff = -0.5 * manifold_dim * scheduler.beta(t)
+    if len(x.shape) == len(t.shape):
+        return laplacian_coeff * x
+    if len(x.shape) == len(t.shape) + 1:
+        return torch.einsum("...,...i->...i", laplacian_coeff, x)
+    return torch.einsum("...,...ij->...ij", laplacian_coeff, x)
+
+
+def _solve_rho(cos_norm: float, manifold_dim: int, init: float = 0.0) -> float:
+    """Solve rho from Kummer function inversion (rdlm/sde.py)."""
+    import numpy as np
+    import scipy.special as sp
+    from scipy.optimize import fsolve
+
+    def f(rho):
+        lhs = np.exp(-rho ** 2 / 2) * sp.hyp1f1(manifold_dim / 2, 0.5, -rho ** 2 / 2)
+        return lhs - cos_norm
+
+    rho = fsolve(f, init)
+    return float(np.abs(rho).item())
+
+
+def _precompute_alpha_rho_init(
+    scheduler,
+    preprocess_steps: int,
+    dims: int,
+    manifold_dim: int,
+    device: torch.device,
+    init_lambda: float,
+    rho_scale: float,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
+    """Precompute alpha/rho for LogBridge_Init (rdlm/sde.py)."""
+    inner_prod = math.sqrt(init_lambda / manifold_dim) if manifold_dim > 0 else 0.0
+    proj_norm = math.sqrt(max(1.0 - inner_prod ** 2, 0.0))
+
+    proj_f = torch.ones(preprocess_steps, device=device) * inner_prod
+    proj_f[-1] = 1.0
+    proj_0 = torch.ones(preprocess_steps, device=device) * inner_prod
+    proj_0[0] = 1.0
+
+    x = torch.stack(
+        [
+            torch.ones(dims, device=device) * inner_prod,
+            torch.ones(dims, device=device),
+        ],
+        dim=-1,
+    )
+
+    timesteps = torch.linspace(0.0, 1.0, preprocess_steps, device=device)
+    dt = timesteps[1] - timesteps[0]
+
+    iterator = tqdm(range(0, timesteps.shape[0] - 2), desc="Precomputing init", leave=False, disable=not _is_main_process())
+    for i in iterator:
+        t = torch.ones(dims, device=device) * timesteps[i]
+        z = torch.randn_like(x)
+
+        laplacian_term = _coord_laplacian(x, t, scheduler, manifold_dim)
+        coeff = scheduler.drift_coeff(t)
+        arccos_x0 = x[..., 0].clamp(min=-1.0 + eps, max=1.0 - eps).arccos()
+        sin_arccos_x0 = (1 - x[..., 0] ** 2).clamp(min=0).sqrt()
+        drift = torch.stack(
+            [
+                coeff * arccos_x0 * sin_arccos_x0,
+                coeff
+                * (inner_prod - x[..., 0] * x[..., 1])
+                * arccos_x0.clamp(min=eps)
+                / sin_arccos_x0.clamp(min=eps),
+            ],
+            dim=-1,
+        ) + laplacian_term
+
+        diffusion = torch.einsum("...,...i->...i", scheduler.beta(t), 1 - x ** 2).clamp(min=0).sqrt()
+        x = x + drift * dt + diffusion * z * dt.abs().sqrt()
+
+        proj_f[i + 1] = x[..., 0].mean()
+        proj_0[i + 1] = x[..., 1].mean()
+
+    rtheta = proj_f / proj_0
+    rtheta = (rtheta - inner_prod) ** 2
+    alphas = (rtheta / (1 - inner_prod ** 2 + rtheta)).sqrt()
+
+    cos_norm_start = proj_0.clamp(min=eps) / (1 - alphas ** 2).sqrt().clamp(min=eps)
+    cos_norm_end = proj_f / (proj_norm * alphas + inner_prod * (1 - alphas ** 2).sqrt())
+    cos_norm = torch.cat([cos_norm_start[: len(alphas) // 2], cos_norm_end[len(alphas) // 2 :]], dim=0)
+
+    rhos = [0.0]
+    for i in tqdm(range(1, len(cos_norm)), leave=False, disable=not _is_main_process()):
+        init = 1e-4 if i == 1 else rhos[-1]
+        rhos.append(_solve_rho(cos_norm[i].item(), manifold_dim, init))
+    rhos = torch.tensor(rhos, device=device) * rho_scale
+
+    return alphas, rhos, inner_prod, proj_norm
+
+
+def _precompute_alpha_rho_mixture(
+    scheduler,
+    preprocess_steps: int,
+    dims: int,
+    manifold_dim: int,
+    device: torch.device,
+    rho_scale: float,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
+    """Precompute alpha/rho for LogBridge_Mixture (rdlm/sde.py)."""
+    inner_prod = 1.0 / math.sqrt(manifold_dim + 1)
+    proj_norm = math.sqrt(max(1.0 - inner_prod ** 2, 0.0))
+
+    proj_f = torch.zeros((2, preprocess_steps), device=device)
+    proj_f[1, ...] = inner_prod
+    proj_f[..., -1] = 1.0
+    proj_0 = torch.zeros((2, preprocess_steps), device=device)
+    proj_0[1, ...] = inner_prod
+    proj_0[..., 0] = 1.0
+
+    x = torch.stack(
+        [
+            torch.zeros(dims, device=device),
+            torch.ones(dims, device=device),
+            torch.ones(dims, device=device) * inner_prod,
+            torch.ones(dims, device=device),
+        ],
+        dim=-1,
+    )
+    timesteps = torch.linspace(0.0, 1.0, preprocess_steps, device=device)
+    dt = timesteps[1] - timesteps[0]
+
+    iterator = tqdm(range(0, timesteps.shape[0] - 2), desc="Precomputing mixture", leave=False, disable=not _is_main_process())
+    for i in iterator:
+        t = torch.ones(dims, device=device) * timesteps[i]
+        z = torch.randn_like(x)
+
+        coeff = scheduler.drift_coeff(t)
+        arccos_x0_mask = x[..., 0].clamp(min=-1.0 + eps, max=1.0 - eps).arccos()
+        sin_arccos_x0_mask = (1 - x[..., 0] ** 2).clamp(min=0).sqrt()
+        arccos_x0_unif = x[..., 2].clamp(min=-1.0 + eps, max=1.0 - eps).arccos()
+        sin_arccos_x0_unif = (1 - x[..., 2] ** 2).clamp(min=0).sqrt()
+
+        drift = torch.stack(
+            [
+                coeff * arccos_x0_mask * sin_arccos_x0_mask,
+                -coeff
+                * x[..., 0]
+                * x[..., 1]
+                * arccos_x0_mask.clamp(min=eps)
+                / sin_arccos_x0_mask.clamp(min=eps),
+                coeff * arccos_x0_unif * sin_arccos_x0_unif,
+                coeff
+                * (inner_prod - x[..., 2] * x[..., 3])
+                * arccos_x0_unif.clamp(min=eps)
+                / sin_arccos_x0_unif.clamp(min=eps),
+            ],
+            dim=-1,
+        ) + _coord_laplacian(x, t, scheduler, manifold_dim)
+
+        diffusion = torch.einsum("...,...i->...i", scheduler.beta(t), 1 - x ** 2).clamp(min=0).sqrt()
+        x = x + drift * dt + diffusion * z * dt.abs().sqrt()
+
+        proj_f[0, i + 1] = x[..., 0].mean()
+        proj_0[0, i + 1] = x[..., 1].mean()
+        proj_f[1, i + 1] = x[..., 2].mean()
+        proj_0[1, i + 1] = x[..., 3].mean()
+
+    rtheta = proj_0[0] / proj_f[0].clamp(min=eps)
+    alphas_mask = 1 / (1 + rtheta ** 2).sqrt()
+    cos_norm_mask = proj_f[0].clamp(min=eps) / alphas_mask
+
+    rtheta_unif = proj_f[1] / proj_0[1]
+    rtheta_unif = (rtheta_unif - inner_prod) ** 2
+    alphas_unif = (rtheta_unif / (1 - inner_prod ** 2 + rtheta_unif)).sqrt()
+
+    cos_norm_start = proj_0[1].clamp(min=eps) / (1 - alphas_unif ** 2).sqrt().clamp(min=eps)
+    cos_norm_end = proj_f[1] / (proj_norm * alphas_unif + inner_prod * (1 - alphas_unif ** 2).sqrt())
+    cos_norm_unif = torch.cat(
+        [cos_norm_start[: len(alphas_unif) // 2], cos_norm_end[len(alphas_unif) // 2 :]], dim=0
+    )
+
+    rhos_mask = [0.0]
+    for i in tqdm(range(1, len(cos_norm_mask)), leave=False, disable=not _is_main_process()):
+        init = 1e-4 if i == 1 else rhos_mask[-1]
+        rhos_mask.append(_solve_rho(cos_norm_mask[i].item(), manifold_dim, init))
+    rhos_mask = torch.tensor(rhos_mask, device=device)
+
+    rhos_unif = [0.0]
+    for i in tqdm(range(1, len(cos_norm_unif)), leave=False, disable=not _is_main_process()):
+        init = 1e-4 if i == 1 else rhos_unif[-1]
+        rhos_unif.append(_solve_rho(cos_norm_unif[i].item(), manifold_dim, init))
+    rhos_unif = torch.tensor(rhos_unif, device=device)
+
+    alphas = torch.stack([alphas_mask, alphas_unif], dim=0)
+    rhos = torch.stack([rhos_mask, rhos_unif], dim=0) * rho_scale
+
+    return alphas, rhos, inner_prod, proj_norm
+
+
 def precompute_alpha_rho(
-    sigma_fn: Callable,
+    sigma_fn: Optional[Callable] = None,
     n_time_steps: int = 1000,
     n_simulations: int = 10000,
-    device: torch.device = torch.device('cpu'),
-    prior_type: str = "uniform"
+    device: torch.device = torch.device("cpu"),
+    prior_type: str = "uniform",
+    schedule=None,
+    manifold_dim: Optional[int] = None,
+    mix_type: Optional[str] = None,
+    mix_step_thr: float = 0.0,
+    rho_scale: float = 1.0,
+    init_lambda: Optional[float] = None,
+    preprocess_dims: int = 2 ** 14,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Precompute α_t and ρ_t via Monte Carlo simulation of 1D projected processes.
+    Precompute alpha_t and rho_t.
 
-    RDLM Equations 18-19:
-    - z^T_t: projection onto target direction e_k
-    - z^0_t: magnitude of orthogonal component
-
-    The bridge SDE in 1D:
-    dz^T_t = γ_t * (1 - (z^T_t)²) / z^T_t * dt + σ_t * √(1 - (z^T_t)²) * dB_t
-
-    Args:
-        sigma_fn: function mapping t -> σ_t
-        n_time_steps: number of discretization steps
-        n_simulations: number of Monte Carlo samples
-        device: torch device
-        prior_type: "uniform" or "masked" (affects initial z^T_0)
-
-    Returns:
-        t_grid: [n_time_steps] time points
-        alpha_t: [n_time_steps] mean of z^T_t (expected projection onto target)
-        rho_t: [n_time_steps] std of orthogonal components
+    If schedule and manifold_dim are provided, uses the reference RDLM precompute
+    (LogBridge_Init/LogBridge_Mixture). Otherwise falls back to the legacy
+    Monte Carlo approximation.
     """
+    if schedule is not None and manifold_dim is not None:
+        preprocess_steps = n_time_steps
+        if prior_type == RDLMPriorType.MIXTURE:
+            alphas, rhos, _, _ = _precompute_alpha_rho_mixture(
+                scheduler=schedule,
+                preprocess_steps=preprocess_steps,
+                dims=preprocess_dims,
+                manifold_dim=manifold_dim,
+                device=device,
+                rho_scale=rho_scale,
+            )
+            t_grid = torch.linspace(0.0, 1.0, preprocess_steps, device=device)
+            return t_grid, alphas, rhos
+        if init_lambda is None:
+            init_lambda = 1.0 if prior_type == RDLMPriorType.UNIFORM else 0.0
+        alphas, rhos, _, _ = _precompute_alpha_rho_init(
+            scheduler=schedule,
+            preprocess_steps=preprocess_steps,
+            dims=preprocess_dims,
+            manifold_dim=manifold_dim,
+            device=device,
+            init_lambda=init_lambda,
+            rho_scale=rho_scale,
+        )
+        t_grid = torch.linspace(0.0, 1.0, preprocess_steps, device=device)
+        return t_grid, alphas, rhos
+
+    if sigma_fn is None:
+        raise ValueError("precompute_alpha_rho requires schedule or sigma_fn.")
+
     dt = 1.0 / n_time_steps
     t_grid = torch.linspace(0, 1 - dt, n_time_steps, device=device)
 
-    # Initialize z^T_0 based on prior
     if prior_type == "masked":
-        # Masked prior: z^T_0 = 0 (orthogonal to any non-mask target)
         z_T = torch.zeros(n_simulations, device=device)
     else:
-        # Uniform prior: z^T_0 ~ uniform on [0, 1]
-        # (projection of uniform sphere point onto random basis vector)
         z_T = torch.rand(n_simulations, device=device)
 
     alpha_t = torch.zeros(n_time_steps, device=device)
     rho_t = torch.zeros(n_time_steps, device=device)
 
-    # Only show progress bar on main process to avoid output conflicts
-    iterator = tqdm(t_grid, desc="Precomputing α_t, ρ_t", leave=False, disable=not _is_main_process())
+    iterator = tqdm(t_grid, desc="Precomputing alpha/rho (legacy)", leave=False, disable=not _is_main_process())
     for i, t in enumerate(iterator):
-        # Record statistics
         alpha_t[i] = z_T.mean()
         z_0_sq = (1 - z_T ** 2).clamp(min=0)
-        rho_t[i] = z_0_sq.mean().sqrt()  # RMS of orthogonal component
+        rho_t[i] = z_0_sq.mean().sqrt()
 
-        # Get noise schedule at current time
         sigma_t = sigma_fn(t)
         if isinstance(sigma_t, torch.Tensor):
             sigma_t = sigma_t.item()
         gamma_t = sigma_t ** 2 / max(1 - t.item(), 1e-4)
 
-        # Brownian increment
         dB = torch.randn(n_simulations, device=device) * (dt ** 0.5)
 
-        # SDE for z^T (Eq. 18)
-        # Avoid division by zero when z_T is near 0
         z_T_safe = z_T.clamp(min=1e-6)
         one_minus_zT_sq = (1 - z_T ** 2).clamp(min=1e-8)
 
@@ -299,7 +718,7 @@ def precompute_alpha_rho(
         diffusion = sigma_t * one_minus_zT_sq.sqrt()
 
         z_T = z_T + drift * dt + diffusion * dB
-        z_T = z_T.clamp(1e-6, 1 - 1e-6)  # Keep in valid range
+        z_T = z_T.clamp(1e-6, 1 - 1e-6)
 
     return t_grid, alpha_t, rho_t
 
@@ -316,6 +735,18 @@ class RDLMScheduleConfig:
     sigma_T: float = 0.2     # beta_f in RDLM (paper uses 0.2)
     n_time_steps: int = 10000  # preprocess_steps in RDLM paper
     prior_type: str = "uniform"
+    add_mask_token: bool = True
+    init_lambda: Optional[float] = None
+    mix_type: str = "step"
+    mix_step_thr: float = 0.0
+    rho_scale: float = 1.0
+    preprocess_dims: int = 2 ** 14
+    weight_type: str = "step"
+    weight_left: float = 0.3
+    weight_right: float = 0.75
+    weight_lb: float = 1e-4
+    weight_ub: float = 1.0
+    eps: float = 1e-6
 
 
 class RDLMSchedule:
@@ -333,6 +764,19 @@ class RDLMSchedule:
         sigma_T: float = 0.2,  # RDLM paper default
         n_time_steps: int = 10000,  # RDLM paper default
         prior_type: str = "uniform",
+        add_mask_token: bool = True,
+        init_lambda: Optional[float] = None,
+        mix_type: str = "step",
+        mix_step_thr: float = 0.0,
+        rho_scale: float = 1.0,
+        preprocess_dims: int = 2 ** 14,
+        weight_type: str = "step",
+        weight_left: float = 0.3,
+        weight_right: float = 0.75,
+        weight_lb: float = 1e-4,
+        weight_ub: float = 1.0,
+        eps: float = 1e-6,
+        manifold_dim: Optional[int] = None,
         device: torch.device = torch.device('cpu'),
         precompute: bool = True
     ):
@@ -342,15 +786,40 @@ class RDLMSchedule:
             sigma_T = config.sigma_T
             n_time_steps = config.n_time_steps
             prior_type = config.prior_type
+            add_mask_token = config.add_mask_token
+            init_lambda = config.init_lambda
+            mix_type = config.mix_type
+            mix_step_thr = config.mix_step_thr
+            rho_scale = config.rho_scale
+            preprocess_dims = config.preprocess_dims
+            weight_type = config.weight_type
+            weight_left = config.weight_left
+            weight_right = config.weight_right
+            weight_lb = config.weight_lb
+            weight_ub = config.weight_ub
+            eps = config.eps
 
         self.schedule_type = schedule_type
         self.sigma_0 = sigma_0
         self.sigma_T = sigma_T
         self.n_time_steps = n_time_steps
         self.prior_type = prior_type
+        self.add_mask_token = add_mask_token
+        self.init_lambda = init_lambda
+        self.mix_type = mix_type
+        self.mix_step_thr = mix_step_thr
+        self.rho_scale = rho_scale
+        self.preprocess_dims = preprocess_dims
+        self.weight_type = weight_type
+        self.weight_left = weight_left
+        self.weight_right = weight_right
+        self.weight_lb = weight_lb
+        self.weight_ub = weight_ub
+        self.eps = eps
+        self.manifold_dim = manifold_dim
         self.device = device
 
-        # Define sigma function
+        # Define beta function
         if schedule_type == "geometric":
             self.sigma_fn = lambda t: geometric_schedule(t, sigma_0, sigma_T)
         elif schedule_type == "linear":
@@ -360,10 +829,42 @@ class RDLMSchedule:
         else:
             raise ValueError(f"Unknown schedule type: {schedule_type}")
 
+        self.weight_fn = get_weight_fn(self.weight_type)(
+            left=self.weight_left,
+            right=self.weight_right,
+            lb=self.weight_lb,
+            ub=self.weight_ub,
+        )
+
+        if self.manifold_dim is None and precompute:
+            raise ValueError("manifold_dim is required for RDLM schedule precomputation.")
+
+        self.preprocess_steps = n_time_steps + 1
+        if self.manifold_dim is not None:
+            if self.prior_type == RDLMPriorType.MIXTURE:
+                self.inner_prod = 1.0 / math.sqrt(self.manifold_dim + 1)
+            else:
+                if self.init_lambda is None:
+                    self.init_lambda = 1.0 if self.prior_type == RDLMPriorType.UNIFORM else 0.0
+                self.inner_prod = math.sqrt(self.init_lambda / self.manifold_dim) if self.manifold_dim > 0 else 0.0
+            self.proj_norm = math.sqrt(max(1.0 - self.inner_prod ** 2, 0.0))
+        else:
+            self.inner_prod = None
+            self.proj_norm = None
+
         # Precompute α_t and ρ_t
         if precompute:
             self.t_grid, self.alpha_t, self.rho_t = precompute_alpha_rho(
-                self.sigma_fn, n_time_steps, device=device, prior_type=prior_type
+                n_time_steps=self.preprocess_steps,
+                device=device,
+                prior_type=prior_type,
+                schedule=self,
+                manifold_dim=self.manifold_dim,
+                mix_type=self.mix_type,
+                mix_step_thr=self.mix_step_thr,
+                rho_scale=self.rho_scale,
+                init_lambda=self.init_lambda,
+                preprocess_dims=self.preprocess_dims,
             )
         else:
             self.t_grid = None
@@ -374,10 +875,35 @@ class RDLMSchedule:
         """Get σ_t at time t."""
         return self.sigma_fn(t)
 
+    def beta(self, t: torch.Tensor) -> torch.Tensor:
+        """Beta schedule (same as sigma_t in RDLM notation)."""
+        return self.sigma_fn(t)
+
+    def drift_coeff(self, t: torch.Tensor) -> torch.Tensor:
+        """Gamma_t = beta_t / int_beta(t)."""
+        return drift_coeff(t, self.schedule_type, self.sigma_0, self.sigma_T, eps=self.eps)
+
     def get_gamma(self, t: torch.Tensor) -> torch.Tensor:
-        """Get γ_t = σ_t² / (1-t) at time t."""
-        sigma_t = self.sigma_fn(t)
-        return bridge_gamma(t, sigma_t)
+        """Alias for drift_coeff."""
+        return self.drift_coeff(t)
+
+    def importance_weight(self, t: torch.Tensor, train: bool) -> torch.Tensor:
+        if train:
+            return self.weight_fn.norm_const / self.weight_fn(t)
+        return torch.ones_like(t)
+
+    def importance_weighted_time(self, shape, device, steps: int = 100) -> torch.Tensor:
+        quantile = torch.rand(shape, device=device) * self.weight_fn.norm_const
+        lb = torch.zeros_like(quantile)
+        ub = torch.ones_like(quantile) * (1 - self.eps)
+
+        for _ in range(steps):
+            mid = (lb + ub) / 2.0
+            value = self.weight_fn.cum_weight_fn(mid)
+            lb = torch.where(value <= quantile, mid, lb)
+            ub = torch.where(value <= quantile, ub, mid)
+
+        return (lb + ub) / 2.0
 
     def get_alpha_rho(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -393,8 +919,22 @@ class RDLMSchedule:
         if self.alpha_t is None:
             raise RuntimeError("Schedule was created with precompute=False")
 
-        t_idx = (t * (self.n_time_steps - 1)).long().clamp(0, self.n_time_steps - 1)
-        return self.alpha_t[t_idx], self.rho_t[t_idx]
+        if self.t_grid is None:
+            raise RuntimeError("Schedule has no t_grid for interpolation.")
+
+        t = t.clamp(min=0.0, max=1.0)
+        idx = torch.searchsorted(self.t_grid, t) - 1
+        idx = idx.clamp(min=0, max=len(self.t_grid) - 2)
+        r = (t - self.t_grid[idx]) / (self.t_grid[idx + 1] - self.t_grid[idx])
+
+        if self.alpha_t.dim() == 1:
+            alpha = self.alpha_t[idx] * (1 - r) + self.alpha_t[idx + 1] * r
+            rho = self.rho_t[idx] * (1 - r) + self.rho_t[idx + 1] * r
+            return alpha, rho
+
+        alpha = self.alpha_t[:, idx] * (1 - r) + self.alpha_t[:, idx + 1] * r
+        rho = self.rho_t[:, idx] * (1 - r) + self.rho_t[:, idx + 1] * r
+        return alpha, rho
 
     def to(self, device: torch.device) -> "RDLMSchedule":
         """Move precomputed tensors to device."""
@@ -468,85 +1008,95 @@ def rdlm_interpolant(
     x0: torch.Tensor,
     target_indices: torch.Tensor,
     t: torch.Tensor,
-    alpha_t: torch.Tensor,
-    rho_t: torch.Tensor,
-    vocab_size: int,
-    add_noise: bool = True
+    alpha_t: Optional[torch.Tensor] = None,
+    rho_t: Optional[torch.Tensor] = None,
+    vocab_size: Optional[int] = None,
+    schedule: Optional[RDLMSchedule] = None,
+    mask_idx: Optional[int] = None,
+    add_noise: bool = True,
 ) -> torch.Tensor:
     """
-    RDLM interpolation using Riemannian normal approximation.
+    RDLM interpolant.
 
-    Memory-optimized version that avoids creating full one-hot tensors.
-
-    The interpolant approximates the bridge marginal X_t | X_1 = e_k
-    using a Riemannian normal centered at α_t * e_k with variance ρ_t².
-
-    Args:
-        x0: [B, L, D] prior samples on sphere
-        target_indices: [B, L] target token indices
-        t: [B] time values in [0, 1]
-        alpha_t: [B] precomputed mean projection (from schedule)
-        rho_t: [B] precomputed std (from schedule)
-        vocab_size: vocabulary size
-        add_noise: whether to add Riemannian normal noise
-
-    Returns:
-        xt: [B, L, D] interpolated samples on sphere
+    If schedule is provided, uses LogBridge_Init/LogBridge_Mixture formulas from
+    the reference implementation. Otherwise falls back to the legacy interpolant
+    using alpha_t and rho_t.
     """
     B, L, D = x0.shape
     device = x0.device
-    dtype = x0.dtype
 
-    # Expand alpha_t for broadcasting
+    if schedule is not None:
+        if mask_idx is None:
+            mask_idx = D - 1
+        end = torch.zeros_like(x0)
+        end.scatter_(-1, target_indices.unsqueeze(-1), 1.0)
+
+        alpha_t, rho_t = schedule.get_alpha_rho(t)
+        if schedule.prior_type == RDLMPriorType.MIXTURE:
+            alphas_mask = alpha_t[0]
+            rhos_mask = rho_t[0]
+            alphas_unif = alpha_t[1]
+            rhos_unif = rho_t[1]
+
+            mu_mask = torch.einsum("...,...ij->...ij", alphas_mask, end) + torch.einsum(
+                "...,...ij->...ij", (1 - alphas_mask ** 2).sqrt(), x0
+            )
+            mu_unif = torch.einsum("...,...ij->...ij", alphas_unif / schedule.proj_norm, end) + torch.einsum(
+                "...,...ij->...ij",
+                (1 - alphas_unif ** 2).sqrt() - alphas_unif * schedule.inner_prod / schedule.proj_norm,
+                x0,
+            )
+
+            mask_flag = x0[..., mask_idx] == 1
+            mu = torch.where(mask_flag.unsqueeze(-1), mu_mask, mu_unif)
+
+            if not add_noise:
+                return mu
+
+            z = torch.randn_like(x0)
+            noise_mask = torch.einsum("...,...ij->...ij", rhos_mask, z)
+            noise_unif = torch.einsum("...,...ij->...ij", rhos_unif, z)
+            normal = mu + torch.where(mask_flag.unsqueeze(-1), noise_mask, noise_unif)
+            tangent = make_tangent(mu, normal)
+            return exp_map(mu, tangent)
+
+        # Init path
+        mu = torch.einsum("...,...ij->...ij", alpha_t / schedule.proj_norm, end) + torch.einsum(
+            "...,...ij->...ij",
+            (1 - alpha_t ** 2).sqrt() - alpha_t * schedule.inner_prod / schedule.proj_norm,
+            x0,
+        )
+
+        if not add_noise:
+            return mu
+
+        z = torch.randn_like(x0)
+        normal = mu + torch.einsum("...,...ij->...ij", rho_t, z)
+        tangent = make_tangent(mu, normal)
+        return exp_map(mu, tangent)
+
+    if alpha_t is None or rho_t is None or vocab_size is None:
+        raise ValueError("rdlm_interpolant requires alpha_t, rho_t, and vocab_size when schedule is None.")
+
+    # Legacy interpolant (kept for compatibility/tests)
     alpha_t_expanded = alpha_t.view(B, 1, 1)
     sqrt_one_minus_alpha_sq = torch.sqrt((1 - alpha_t ** 2).clamp(min=0)).view(B, 1, 1)
 
-    # Get x0's component at target index: <x0, e_k> = x0[k]
-    x0_at_target = x0.gather(dim=-1, index=target_indices.unsqueeze(-1))  # [B, L, 1]
-
-    # Orthogonal component magnitude: ||x0 - <x0, e_k> * e_k|| = sqrt(1 - x0[k]^2)
-    # But we need the normalized orthogonal direction
+    x0_at_target = x0.gather(dim=-1, index=target_indices.unsqueeze(-1))
     x0_orth_sq = (1 - x0_at_target ** 2).clamp(min=1e-12)
-    x0_orth_norm = torch.sqrt(x0_orth_sq)  # [B, L, 1]
+    x0_orth_norm = torch.sqrt(x0_orth_sq)
 
-    # Mean on sphere: α_t * e_k + √(1-α_t²) * (x0 - x0[k]*e_k) / ||x0 - x0[k]*e_k||
-    # = α_t * e_k + √(1-α_t²) * x0_orthogonal_normalized
-
-    # For non-target indices j != k:
-    #   mean[j] = √(1-α_t²) * x0[j] / ||x0_orth||
-    # For target index k:
-    #   mean[k] = α_t + √(1-α_t²) * (x0[k] - x0[k]) / ||x0_orth|| = α_t
-
-    # Compute mean efficiently without full one-hot
-    # mean = √(1-α_t²) * x0 / ||x0_orth|| for all positions
     mean_on_sphere = x0 * (sqrt_one_minus_alpha_sq / x0_orth_norm)
-
-    # Then fix the target position: subtract the wrong value and add α_t
-    # Current value at k: √(1-α_t²) * x0[k] / ||x0_orth||
-    # Correct value at k: α_t + √(1-α_t²) * 0 = α_t (since orthogonal component at k is 0)
-    # But wait - we need to be more careful here
-
-    # Actually, x0_orthogonal = x0 - x0[k] * e_k
-    # x0_orthogonal[j] = x0[j] for j != k
-    # x0_orthogonal[k] = x0[k] - x0[k] = 0
-
-    # So mean[j] = √(1-α_t²) * x0[j] / ||x0_orth|| for j != k
-    # mean[k] = α_t + √(1-α_t²) * 0 / ||x0_orth|| = α_t
-
-    # Fix target index: set mean[k] = α_t
     mean_on_sphere.scatter_(
         dim=-1,
         index=target_indices.unsqueeze(-1),
-        src=alpha_t_expanded.expand(B, L, 1)
+        src=alpha_t_expanded.expand(B, L, 1),
     )
-
-    # Normalize to sphere
     mean_norm = mean_on_sphere.norm(dim=-1, keepdim=True).clamp_(min=1e-8)
     mean_on_sphere.div_(mean_norm)
     del mean_norm, x0_at_target, x0_orth_sq, x0_orth_norm
 
     if add_noise:
-        # Sample from Riemannian normal around mean
         xt = sample_riemannian_normal(mean_on_sphere, rho_t)
         del mean_on_sphere
     else:

@@ -77,9 +77,33 @@ def parse_args():
         help="Noise schedule type",
     )
     parser.add_argument(
-        "--stochastic",
+        "--deterministic",
         action="store_true",
-        help="Use stochastic sampling (add noise during integration)",
+        help="Disable stochastic sampling (use deterministic integration)",
+    )
+    parser.add_argument(
+        "--mix_type",
+        type=str,
+        default="step",
+        choices=["linear", "sqrt", "step"],
+        help="Mixture schedule type",
+    )
+    parser.add_argument(
+        "--mix_step_thr",
+        type=float,
+        default=0.0,
+        help="Step threshold for mix_type=step",
+    )
+    parser.add_argument(
+        "--sampling_eps",
+        type=float,
+        default=1e-5,
+        help="Sampling epsilon to avoid t=1",
+    )
+    parser.add_argument(
+        "--no_mask_token",
+        action="store_true",
+        help="Disable extra mask token dimension (RDLM default is to add one)",
     )
     parser.add_argument(
         "--device",
@@ -113,7 +137,11 @@ def main():
         temperature=args.temperature,
         prior_type=args.prior_type,
         schedule_type=args.schedule_type,
-        stochastic=args.stochastic,
+        stochastic=not args.deterministic,
+        mix_type=args.mix_type,
+        mix_step_thr=args.mix_step_thr,
+        sampling_eps=args.sampling_eps,
+        add_mask_token=not args.no_mask_token,
     )
 
     # Tokenize prompt
@@ -169,6 +197,11 @@ def infill_demo():
         temperature=args.temperature,
         prior_type=args.prior_type,
         schedule_type=args.schedule_type,
+        stochastic=not args.deterministic,
+        mix_type=args.mix_type,
+        mix_step_thr=args.mix_step_thr,
+        sampling_eps=args.sampling_eps,
+        add_mask_token=not args.no_mask_token,
     )
 
     # Example with masks

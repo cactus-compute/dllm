@@ -111,14 +111,12 @@ class TestNoiseSchedules:
 
     def test_bridge_gamma_increasing(self):
         """Test bridge gamma coefficient increases with t."""
-        from dllm.pipelines.bert_rdlm.rdlm_utils import bridge_gamma, geometric_schedule
+        from dllm.pipelines.bert_rdlm.rdlm_utils import bridge_gamma
 
         t = torch.linspace(0.1, 0.9, 50)
-        sigma_t = geometric_schedule(t)
-        gamma = bridge_gamma(t, sigma_t)
+        gamma = bridge_gamma(t, sigma_0=0.001, sigma_T=0.2, schedule_type="geometric")
 
-        # gamma_t = sigma_t^2 / (1-t) should increase as t approaches 1
-        # (both numerator increases and denominator decreases)
+        # Drift coeff should increase as t approaches 1 for geometric schedule
         assert gamma[-1] > gamma[0]
 
 
@@ -133,13 +131,15 @@ class TestRDLMSchedule:
             schedule_type="geometric",
             sigma_0=0.001,
             sigma_T=1.0,
-            n_time_steps=100,
-            precompute=True
+            n_time_steps=10,
+            precompute=True,
+            preprocess_dims=64,
+            manifold_dim=63,
         )
 
         assert schedule.alpha_t is not None
         assert schedule.rho_t is not None
-        assert len(schedule.alpha_t) == 100
+        assert len(schedule.alpha_t) == 11
 
     def test_schedule_alpha_rho_lookup(self):
         """Test alpha/rho lookup."""
@@ -147,8 +147,10 @@ class TestRDLMSchedule:
 
         schedule = RDLMSchedule(
             schedule_type="geometric",
-            n_time_steps=100,
-            precompute=True
+            n_time_steps=10,
+            precompute=True,
+            preprocess_dims=64,
+            manifold_dim=63,
         )
 
         t = torch.tensor([0.0, 0.5, 0.99])
@@ -161,7 +163,7 @@ class TestRDLMSchedule:
         """Test schedule can move to device."""
         from dllm.pipelines.bert_rdlm.rdlm_utils import RDLMSchedule
 
-        schedule = RDLMSchedule(n_time_steps=50, precompute=True)
+        schedule = RDLMSchedule(n_time_steps=10, precompute=True, preprocess_dims=64, manifold_dim=63)
 
         # Should not error even on CPU
         schedule = schedule.to(torch.device('cpu'))
@@ -363,7 +365,7 @@ class TestIntegration:
         context_embeds = mock_model.get_input_embeddings()(torch.zeros(B, T, dtype=torch.long))
         attention_mask = torch.ones(B, T, dtype=torch.long)
 
-        config = BertRDLMSamplerConfig(n_steps=5, temperature=1.0)
+        config = BertRDLMSamplerConfig(n_steps=5, temperature=1.0, add_mask_token=False)
 
         x_final = sampler.flow_integrate(
             x_sphere=x_sphere,
