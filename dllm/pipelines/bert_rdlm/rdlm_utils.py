@@ -1016,7 +1016,7 @@ def rdlm_interpolant(
     add_noise: bool = True,
 ) -> torch.Tensor:
     """
-    RDLM interpolant.
+    RDLM interpolant (memory-optimized).
 
     If schedule is provided, uses LogBridge_Init/LogBridge_Mixture formulas from
     the reference implementation. Otherwise falls back to the legacy interpolant
@@ -1028,52 +1028,78 @@ def rdlm_interpolant(
     if schedule is not None:
         if mask_idx is None:
             mask_idx = D - 1
-        end = torch.zeros_like(x0)
-        end.scatter_(-1, target_indices.unsqueeze(-1), 1.0)
 
         alpha_t, rho_t = schedule.get_alpha_rho(t)
+
         if schedule.prior_type == RDLMPriorType.MIXTURE:
-            alphas_mask = alpha_t[0]
-            rhos_mask = rho_t[0]
-            alphas_unif = alpha_t[1]
-            rhos_unif = rho_t[1]
+            alphas_mask = alpha_t[0].view(-1, 1, 1)
+            rhos_mask = rho_t[0].view(-1, 1, 1)
+            alphas_unif = alpha_t[1].view(-1, 1, 1)
+            rhos_unif = rho_t[1].view(-1, 1, 1)
 
-            mu_mask = torch.einsum("...,...ij->...ij", alphas_mask, end) + torch.einsum(
-                "...,...ij->...ij", (1 - alphas_mask ** 2).sqrt(), x0
-            )
-            mu_unif = torch.einsum("...,...ij->...ij", alphas_unif / schedule.proj_norm, end) + torch.einsum(
-                "...,...ij->...ij",
-                (1 - alphas_unif ** 2).sqrt() - alphas_unif * schedule.inner_prod / schedule.proj_norm,
-                x0,
-            )
+            # Determine which samples use mask vs uniform prior
+            mask_flag = (x0[..., mask_idx] == 1).unsqueeze(-1)  # [B, L, 1]
 
-            mask_flag = x0[..., mask_idx] == 1
-            mu = torch.where(mask_flag.unsqueeze(-1), mu_mask, mu_unif)
+            # Compute coefficients for x0 term (in-place where possible)
+            sqrt_one_minus_alpha_mask_sq = (1 - alphas_mask.squeeze(-1) ** 2).sqrt().view(-1, 1, 1)
+            sqrt_one_minus_alpha_unif_sq = (1 - alphas_unif.squeeze(-1) ** 2).sqrt().view(-1, 1, 1)
+            unif_x0_coeff = sqrt_one_minus_alpha_unif_sq - alphas_unif * schedule.inner_prod / schedule.proj_norm
+
+            # Select coefficients based on mask_flag
+            alpha_coeff = torch.where(mask_flag, alphas_mask, alphas_unif / schedule.proj_norm)
+            x0_coeff = torch.where(mask_flag, sqrt_one_minus_alpha_mask_sq, unif_x0_coeff)
+
+            # Build mu in-place: mu = alpha_coeff * end + x0_coeff * x0
+            # end is one-hot at target_indices
+            mu = x0 * x0_coeff
+            mu.scatter_add_(-1, target_indices.unsqueeze(-1), alpha_coeff.expand(B, L, 1))
+
+            del alpha_coeff, x0_coeff, sqrt_one_minus_alpha_mask_sq, sqrt_one_minus_alpha_unif_sq, unif_x0_coeff
 
             if not add_noise:
                 return mu
 
+            # Add noise with coefficient based on mask_flag
+            rho_coeff = torch.where(mask_flag, rhos_mask, rhos_unif)
             z = torch.randn_like(x0)
-            noise_mask = torch.einsum("...,...ij->...ij", rhos_mask, z)
-            noise_unif = torch.einsum("...,...ij->...ij", rhos_unif, z)
-            normal = mu + torch.where(mask_flag.unsqueeze(-1), noise_mask, noise_unif)
-            tangent = make_tangent(mu, normal)
-            return exp_map(mu, tangent)
+            z.mul_(rho_coeff)
+            normal = mu + z
+            del z, rho_coeff, mask_flag
 
-        # Init path
-        mu = torch.einsum("...,...ij->...ij", alpha_t / schedule.proj_norm, end) + torch.einsum(
-            "...,...ij->...ij",
-            (1 - alpha_t ** 2).sqrt() - alpha_t * schedule.inner_prod / schedule.proj_norm,
-            x0,
-        )
+            tangent = make_tangent(mu, normal)
+            del normal
+            result = exp_map(mu, tangent)
+            del mu, tangent
+            return result
+
+        # Init path (non-mixture)
+        alpha_t = alpha_t.view(-1, 1, 1)
+        rho_t = rho_t.view(-1, 1, 1)
+
+        # Compute coefficients
+        alpha_over_proj = alpha_t / schedule.proj_norm
+        sqrt_one_minus_alpha_sq = (1 - alpha_t ** 2).sqrt()
+        x0_coeff = sqrt_one_minus_alpha_sq - alpha_t * schedule.inner_prod / schedule.proj_norm
+
+        # Build mu: mu = (alpha_t / proj_norm) * end + x0_coeff * x0
+        mu = x0 * x0_coeff
+        mu.scatter_add_(-1, target_indices.unsqueeze(-1), alpha_over_proj.expand(B, L, 1))
+
+        del alpha_over_proj, sqrt_one_minus_alpha_sq, x0_coeff
 
         if not add_noise:
             return mu
 
         z = torch.randn_like(x0)
-        normal = mu + torch.einsum("...,...ij->...ij", rho_t, z)
+        z.mul_(rho_t)
+        normal = mu + z
+        del z
+
         tangent = make_tangent(mu, normal)
-        return exp_map(mu, tangent)
+        del normal
+        result = exp_map(mu, tangent)
+        del mu, tangent
+        return result
 
     if alpha_t is None or rho_t is None or vocab_size is None:
         raise ValueError("rdlm_interpolant requires alpha_t, rho_t, and vocab_size when schedule is None.")
@@ -1155,11 +1181,20 @@ def expected_drift_from_probs(
     gamma_t: torch.Tensor
 ) -> torch.Tensor:
     """
-    Compute expected drift from predicted probabilities.
+    Compute expected drift from predicted probabilities (memory-efficient).
 
     E[γ_t * log_{X_t}(e_k)] = γ_t * Σ_k p_k * log_{xt}(e_k)
 
     This is used when the model outputs probabilities rather than drift directly.
+
+    Memory-optimized: avoids creating [B, L, D, D] tensors by computing the
+    weighted sum analytically. The log map to basis vector e_k is:
+        log_xt(e_k) = θ_k * (e_k - xt * cos(θ_k)) / sin(θ_k)
+    where θ_k = arccos(<xt, e_k>) = arccos(xt[k]).
+
+    The expected log map is:
+        Σ_k p_k * log_xt(e_k) = Σ_k p_k * θ_k * (e_k - xt * cos(θ_k)) / sin(θ_k)
+                              = Σ_k p_k * θ_k / sin(θ_k) * e_k - xt * Σ_k p_k * θ_k * cos(θ_k) / sin(θ_k)
 
     Args:
         xt: [B, L, D] current position on sphere
@@ -1169,36 +1204,27 @@ def expected_drift_from_probs(
     Returns:
         expected_drift: [B, L, D] expected tangent vector
     """
-    B, L, D = xt.shape
-    device = xt.device
+    # Inner product <xt, e_k> = xt[k] for each k
+    inner = xt.clamp(-1 + 1e-6, 1 - 1e-6)  # [B, L, D]
 
-    # For efficiency, we compute the weighted sum of log maps
-    # log_xt(e_k) = angle_k * (e_k - xt * cos(angle_k)) / |e_k - xt * cos(angle_k)|
-
-    # Inner product <xt, e_k> for each k
-    # xt: [B, L, D], e_k is k-th column of identity
-    # <xt, e_k> = xt[..., k]
-    inner = xt  # [B, L, D] - inner product with each basis vector
-    inner = inner.clamp(-1 + 1e-6, 1 - 1e-6)
-
-    # Angles to each basis vector
+    # Angles to each basis vector: θ_k = arccos(xt[k])
     angles = torch.arccos(inner)  # [B, L, D]
 
-    # Direction vectors: e_k - xt * <xt, e_k>
-    # e_k has 1 at position k, so e_k - xt * inner_k
-    eye = torch.eye(D, device=device)  # [D, D]
-    directions = eye.unsqueeze(0).unsqueeze(0) - xt.unsqueeze(-1) * inner.unsqueeze(-2)  # [B, L, D, D]
+    # sin(θ_k) = sqrt(1 - xt[k]^2)
+    sin_angles = (1 - inner ** 2).sqrt().clamp(min=1e-8)  # [B, L, D]
 
-    # Normalize directions
-    dir_norms = directions.norm(dim=-2, keepdim=True).clamp(min=1e-8)  # [B, L, 1, D]
-    directions = directions / dir_norms  # [B, L, D, D]
+    # Compute θ_k / sin(θ_k) - this is the scaling factor for each log map
+    # Handle θ ≈ 0 case where θ/sin(θ) → 1
+    angle_scale = angles / sin_angles  # [B, L, D]
 
-    # Log vectors: angle * direction
-    log_vecs = directions * angles.unsqueeze(-2)  # [B, L, D, D]
+    # Expected log map = Σ_k p_k * θ_k / sin(θ_k) * e_k - xt * Σ_k p_k * θ_k * cos(θ_k) / sin(θ_k)
+    # First term: coefficient for each basis vector e_k
+    first_term = probs * angle_scale  # [B, L, D] - this IS the result (weighted sum of e_k)
 
-    # Weight by probabilities and sum over vocabulary
-    probs_expanded = probs.unsqueeze(-2)  # [B, L, 1, D]
-    expected_log = (log_vecs * probs_expanded).sum(dim=-1)  # [B, L, D]
+    # Second term: scalar coefficient for xt
+    second_term_coeff = (probs * angle_scale * inner).sum(dim=-1, keepdim=True)  # [B, L, 1]
+
+    expected_log = first_term - xt * second_term_coeff  # [B, L, D]
 
     # Scale by γ_t
     if isinstance(gamma_t, torch.Tensor) and gamma_t.dim() >= 1:
