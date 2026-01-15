@@ -269,6 +269,7 @@ class BertRDLMTrainer(transformers.Trainer):
 
         # Get interpolated samples
         xt = self.interpolate(x0, input_ids, t)
+        del x0  # Free memory
 
         # Keep prompt positions clean (not noised)
         if not loss_mask.all():
@@ -280,6 +281,8 @@ class BertRDLMTrainer(transformers.Trainer):
         # Compute soft embeddings
         x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
         soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
+        if x_embed is not xt:
+            del x_embed  # Free if we created a new tensor
 
         # Add time embedding if enabled
         if self.use_time_embedding:
@@ -291,13 +294,16 @@ class BertRDLMTrainer(transformers.Trainer):
                 ).to(device=device, dtype=compute_dtype)
             time_emb = self.time_embedding(t)
             soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
+            del time_emb
 
         # Forward pass
         outputs = model(
             inputs_embeds=soft_embeddings,
             attention_mask=attention_mask,
         )
+        del soft_embeddings  # Free memory before logits allocation
         logits = outputs.logits  # [B, L, V]
+        del outputs
 
         # Compute loss based on loss type
         if self.loss_type == "ce":

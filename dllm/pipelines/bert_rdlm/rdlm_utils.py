@@ -409,6 +409,8 @@ def sample_riemannian_normal(
 
     N_R(μ, σ²I) where μ is on the sphere.
 
+    Memory-optimized version using in-place operations.
+
     Args:
         mean_direction: [B, L, D] mean direction on sphere
         scale: [B] or [B, 1, 1] standard deviation ρ_t
@@ -420,17 +422,29 @@ def sample_riemannian_normal(
     if base_point is None:
         base_point = mean_direction
 
-    # Sample in tangent space
-    tangent_noise = torch.randn_like(mean_direction)
-    tangent_noise = make_tangent(base_point, tangent_noise)
+    # Sample in tangent space (in-place projection)
+    tangent_vec = torch.randn_like(mean_direction)
+    # Project to tangent space: v - <v, p> * p
+    dot = (tangent_vec * base_point).sum(dim=-1, keepdim=True)
+    tangent_vec.sub_(dot * base_point)
+    del dot
 
-    # Scale by ρ_t
+    # Scale by ρ_t (in-place)
     if scale.dim() == 1:
         scale = scale.view(-1, 1, 1)
-    tangent_vec = tangent_noise * scale
+    tangent_vec.mul_(scale)
 
-    # Map to sphere via exponential map
-    samples = exp_map(mean_direction, tangent_vec)
+    # Map to sphere via exponential map (in-place where possible)
+    v_norm = tangent_vec.norm(dim=-1, keepdim=True).clamp_(min=1e-8)
+    cos_v = torch.cos(v_norm)
+    sin_v = torch.sin(v_norm)
+    sin_v.div_(v_norm)
+
+    # samples = mean * cos(|v|) + v * sin(|v|)/|v|
+    samples = mean_direction * cos_v
+    samples.addcmul_(tangent_vec, sin_v)
+
+    del tangent_vec, v_norm, cos_v, sin_v
 
     return samples
 
@@ -451,6 +465,8 @@ def rdlm_interpolant(
     """
     RDLM interpolation using Riemannian normal approximation.
 
+    Memory-optimized version that avoids creating full one-hot tensors.
+
     The interpolant approximates the bridge marginal X_t | X_1 = e_k
     using a Riemannian normal centered at α_t * e_k with variance ρ_t².
 
@@ -470,28 +486,58 @@ def rdlm_interpolant(
     device = x0.device
     dtype = x0.dtype
 
-    # Create one-hot targets (on sphere, these are basis vectors e_k)
-    x1 = torch.zeros(B, L, vocab_size, device=device, dtype=dtype)
-    x1.scatter_(-1, target_indices.unsqueeze(-1), 1.0)
-
-    # Mean direction: scaled toward target
-    # At t=0: mostly x0 direction, at t=1: mostly x1 direction
+    # Expand alpha_t for broadcasting
     alpha_t_expanded = alpha_t.view(B, 1, 1)
-
-    # Project x0 orthogonal to x1 to get orthogonal direction
-    x0_proj_x1 = x1 * (x0 * x1).sum(-1, keepdim=True)  # Component of x0 along x1
-    x0_orthogonal = x0 - x0_proj_x1
-    x0_orth_norm = x0_orthogonal.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    x0_orthogonal = x0_orthogonal / x0_orth_norm  # Normalized orthogonal component
-
-    # Construct mean on sphere: α_t * e_k + √(1-α_t²) * orthogonal_direction
     sqrt_one_minus_alpha_sq = torch.sqrt((1 - alpha_t ** 2).clamp(min=0)).view(B, 1, 1)
-    mean_on_sphere = alpha_t_expanded * x1 + sqrt_one_minus_alpha_sq * x0_orthogonal
-    mean_on_sphere = mean_on_sphere / mean_on_sphere.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    # Get x0's component at target index: <x0, e_k> = x0[k]
+    x0_at_target = x0.gather(dim=-1, index=target_indices.unsqueeze(-1))  # [B, L, 1]
+
+    # Orthogonal component magnitude: ||x0 - <x0, e_k> * e_k|| = sqrt(1 - x0[k]^2)
+    # But we need the normalized orthogonal direction
+    x0_orth_sq = (1 - x0_at_target ** 2).clamp(min=1e-12)
+    x0_orth_norm = torch.sqrt(x0_orth_sq)  # [B, L, 1]
+
+    # Mean on sphere: α_t * e_k + √(1-α_t²) * (x0 - x0[k]*e_k) / ||x0 - x0[k]*e_k||
+    # = α_t * e_k + √(1-α_t²) * x0_orthogonal_normalized
+
+    # For non-target indices j != k:
+    #   mean[j] = √(1-α_t²) * x0[j] / ||x0_orth||
+    # For target index k:
+    #   mean[k] = α_t + √(1-α_t²) * (x0[k] - x0[k]) / ||x0_orth|| = α_t
+
+    # Compute mean efficiently without full one-hot
+    # mean = √(1-α_t²) * x0 / ||x0_orth|| for all positions
+    mean_on_sphere = x0 * (sqrt_one_minus_alpha_sq / x0_orth_norm)
+
+    # Then fix the target position: subtract the wrong value and add α_t
+    # Current value at k: √(1-α_t²) * x0[k] / ||x0_orth||
+    # Correct value at k: α_t + √(1-α_t²) * 0 = α_t (since orthogonal component at k is 0)
+    # But wait - we need to be more careful here
+
+    # Actually, x0_orthogonal = x0 - x0[k] * e_k
+    # x0_orthogonal[j] = x0[j] for j != k
+    # x0_orthogonal[k] = x0[k] - x0[k] = 0
+
+    # So mean[j] = √(1-α_t²) * x0[j] / ||x0_orth|| for j != k
+    # mean[k] = α_t + √(1-α_t²) * 0 / ||x0_orth|| = α_t
+
+    # Fix target index: set mean[k] = α_t
+    mean_on_sphere.scatter_(
+        dim=-1,
+        index=target_indices.unsqueeze(-1),
+        src=alpha_t_expanded.expand(B, L, 1)
+    )
+
+    # Normalize to sphere
+    mean_norm = mean_on_sphere.norm(dim=-1, keepdim=True).clamp_(min=1e-8)
+    mean_on_sphere.div_(mean_norm)
+    del mean_norm, x0_at_target, x0_orth_sq, x0_orth_norm
 
     if add_noise:
         # Sample from Riemannian normal around mean
         xt = sample_riemannian_normal(mean_on_sphere, rho_t)
+        del mean_on_sphere
     else:
         xt = mean_on_sphere
 
