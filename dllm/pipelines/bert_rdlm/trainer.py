@@ -1,0 +1,451 @@
+"""
+BertRDLMTrainer: Trainer class for BERT with RDLM objective.
+
+Extends BertSFMTrainer with RDLM-specific:
+- Prior distributions (masked, mixture)
+- Riemannian normal interpolation
+- Geometric noise schedule
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+
+import transformers
+
+from dllm.utils.configs import TrainingArguments
+from dllm.core.trainers.utils import NLLMetric, PPLMetric, OnEvaluateMetricsCallback
+from dllm.pipelines.bert_sfm.geodesic_utils import (
+    exp_map, log_map, make_tangent, uniform_prior,
+    simplex_to_sphere, sphere_to_simplex,
+    TimeEmbedding,
+)
+from dllm.pipelines.bert_sfm.trainer import geodesic_interpolant_to_onehot
+
+from .rdlm_utils import (
+    RDLMSchedule,
+    RDLMScheduleConfig,
+    RDLMPriorType,
+    get_rdlm_prior,
+    rdlm_interpolant,
+    compute_target_drift,
+)
+
+
+@dataclass
+class BertRDLMTrainerConfig(TrainingArguments):
+    """Configuration for BertRDLMTrainer."""
+    # Prior configuration
+    prior_type: str = "mixture"  # "uniform", "masked", or "mixture"
+    mixing_prob: float = 0.5    # For mixture prior
+    mask_idx: int = -1          # Index of mask token (default: last)
+
+    # Schedule configuration
+    schedule_type: str = "geometric"
+    sigma_0: float = 0.001
+    sigma_T: float = 1.0
+    n_time_steps: int = 1000
+
+    # Interpolation
+    use_riemannian_normal: bool = True
+
+    # Loss
+    loss_type: str = "ce"  # "ce" or "mse"
+    loss_norm_type: str = "token"  # "batch", "sequence", "token"
+
+    # Embedding
+    embed_type: str = "spherical"  # "spherical" or "simplex"
+
+    # Time sampling
+    time_eps: float = 1e-4  # Avoid t=0 and t=1
+
+    # Evaluation - use 100 steps for realistic generation quality measurement
+    eval_integration_steps: int = 100
+
+    # Time embedding
+    use_time_embedding: bool = False
+    time_embedding_scale: float = 30.0
+
+
+class BertRDLMTrainer(transformers.Trainer):
+    """
+    BERT trainer with RDLM (Riemannian Diffusion Language Model) objective.
+
+    Key differences from BertSFMTrainer:
+    1. Supports masked and mixture priors (not just uniform)
+    2. Uses Riemannian normal approximation for simulation-free training
+    3. Precomputes α_t and ρ_t parameters
+    4. Default geometric noise schedule
+    """
+
+    def __init__(
+        self,
+        model,
+        args: BertRDLMTrainerConfig,
+        **kwargs
+    ):
+        super().__init__(model=model, args=args, **kwargs)
+
+        # Store RDLM config from args
+        self.prior_type = args.prior_type
+        self.mixing_prob = args.mixing_prob
+        self.use_riemannian_normal = args.use_riemannian_normal
+        self.loss_type = args.loss_type
+        self.loss_norm_type = args.loss_norm_type
+        self.embed_type = args.embed_type
+        self.time_eps = args.time_eps
+        self.eval_integration_steps = args.eval_integration_steps
+        self.use_time_embedding = args.use_time_embedding
+        self.time_embedding_scale = args.time_embedding_scale
+
+        # Get vocab size from model
+        unwrapped_model = model.module if hasattr(model, 'module') else model
+        if hasattr(unwrapped_model.config, 'vocab_size'):
+            self.vocab_size = unwrapped_model.config.vocab_size
+        else:
+            self.vocab_size = kwargs.get('vocab_size', 30522)
+
+        # Set mask index
+        if args.mask_idx == -1:
+            self.mask_idx = self.vocab_size - 1
+        else:
+            self.mask_idx = args.mask_idx
+
+        # Initialize RDLM schedule with precomputed values
+        # Note: We defer device placement until first compute_loss call
+        self.rdlm_schedule = None
+        self.schedule_config = RDLMScheduleConfig(
+            schedule_type=args.schedule_type,
+            sigma_0=args.sigma_0,
+            sigma_T=args.sigma_T,
+            n_time_steps=args.n_time_steps,
+            prior_type=args.prior_type,
+        )
+
+        # Time embedding (initialized lazily)
+        self.time_embedding = None
+
+        # Metrics
+        self.meter = OnEvaluateMetricsCallback(
+            trainer=self,
+            splits=("train", "eval"),
+            metrics={"nll": NLLMetric(), "ppl": PPLMetric()},
+        )
+        self.add_callback(self.meter)
+
+    def _ensure_schedule(self, device: torch.device):
+        """Ensure RDLM schedule is initialized and on correct device."""
+        if self.rdlm_schedule is None:
+            self.rdlm_schedule = RDLMSchedule(
+                config=self.schedule_config,
+                device=device,
+                precompute=True
+            )
+        elif self.rdlm_schedule.device != device:
+            self.rdlm_schedule = self.rdlm_schedule.to(device)
+
+    def get_prior_samples(
+        self,
+        shape: tuple,
+        device: torch.device,
+        dtype: torch.dtype,
+        t: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Sample from RDLM prior distribution.
+
+        Args:
+            shape: (batch_size, seq_len, vocab_size)
+            device: torch device
+            dtype: tensor dtype
+            t: optional time values for time-dependent mixture
+
+        Returns:
+            x0: [B, L, D] prior samples on hypersphere
+        """
+        return get_rdlm_prior(
+            prior_type=self.prior_type,
+            shape=shape,
+            device=device,
+            dtype=dtype,
+            t=t,
+            mask_idx=self.mask_idx,
+            mixing_prob=self.mixing_prob
+        )
+
+    def interpolate(
+        self,
+        x0: torch.Tensor,
+        target_indices: torch.Tensor,
+        t: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute interpolated samples using RDLM method.
+
+        Args:
+            x0: [B, L, D] prior samples
+            target_indices: [B, L] target token indices
+            t: [B] time values
+
+        Returns:
+            xt: [B, L, D] interpolated samples on sphere
+        """
+        if self.use_riemannian_normal:
+            # Get precomputed α_t and ρ_t
+            alpha_t, rho_t = self.rdlm_schedule.get_alpha_rho(t)
+
+            return rdlm_interpolant(
+                x0=x0,
+                target_indices=target_indices,
+                t=t,
+                alpha_t=alpha_t,
+                rho_t=rho_t,
+                vocab_size=self.vocab_size,
+                add_noise=True
+            )
+        else:
+            # Fall back to geodesic interpolation
+            return geodesic_interpolant_to_onehot(x0, target_indices, t)
+
+    def compute_loss(
+        self,
+        model,
+        inputs: Dict[str, torch.Tensor],
+        return_outputs: bool = False,
+        **kwargs
+    ):
+        """
+        Compute RDLM training loss.
+
+        Args:
+            model: the model being trained
+            inputs: dict with "input_ids" [B, L]
+            return_outputs: whether to return model outputs
+
+        Returns:
+            loss or (loss, outputs) if return_outputs=True
+        """
+        assert self.processing_class.padding_side == "right"
+
+        input_ids = inputs["input_ids"]
+        labels = inputs["labels"]
+        attention_mask = inputs.get("attention_mask", None)
+
+        B, L = input_ids.shape
+        device = input_ids.device
+
+        # Get the actual model device (may differ from input device due to HF Trainer)
+        unwrapped_model = model.module if hasattr(model, 'module') else model
+        model_device = next(unwrapped_model.parameters()).device
+        if device != model_device:
+            device = model_device
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
+        # Ensure schedule is initialized and on correct device
+        self._ensure_schedule(device)
+
+        # Positions where we compute loss (not -100)
+        loss_mask = labels != -100  # [b, l]
+
+        # Get embedding layer and compute dtype
+        unwrapped_model = model.module if hasattr(model, 'module') else model
+        if hasattr(unwrapped_model, "get_input_embeddings"):
+            embed_layer = unwrapped_model.get_input_embeddings()
+        else:
+            embed_layer = unwrapped_model.model.embed_tokens
+        compute_dtype = embed_layer.weight.dtype
+
+        # Sample time uniformly in (eps, 1-eps)
+        eps = self.time_eps
+        t = eps + (1 - 2 * eps) * torch.rand(B, device=device)
+
+        # Sample from prior
+        x0 = self.get_prior_samples((B, L, self.vocab_size), device, compute_dtype, t)
+
+        # Get interpolated samples
+        xt = self.interpolate(x0, input_ids, t)
+
+        # Keep prompt positions clean (not noised)
+        if not loss_mask.all():
+            prompt_mask = ~loss_mask
+            xt[prompt_mask] = 0
+            prompt_indices = input_ids[prompt_mask].unsqueeze(-1)
+            xt[prompt_mask] = xt[prompt_mask].scatter(-1, prompt_indices, 1.0)
+
+        # Compute soft embeddings
+        x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
+        soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
+
+        # Add time embedding if enabled
+        if self.use_time_embedding:
+            if self.time_embedding is None:
+                hidden_size = embed_layer.weight.shape[1]
+                self.time_embedding = TimeEmbedding(
+                    hidden_size=hidden_size,
+                    scale=self.time_embedding_scale,
+                ).to(device=device, dtype=compute_dtype)
+            time_emb = self.time_embedding(t)
+            soft_embeddings = soft_embeddings + time_emb.unsqueeze(1).to(soft_embeddings.dtype)
+
+        # Forward pass
+        outputs = model(
+            inputs_embeds=soft_embeddings,
+            attention_mask=attention_mask,
+        )
+        logits = outputs.logits  # [B, L, V]
+
+        # Compute loss based on loss type
+        if self.loss_type == "ce":
+            # Cross-entropy loss
+            token_loss = F.cross_entropy(
+                logits.transpose(1, 2),  # [B, V, L]
+                input_ids,  # [B, L]
+                reduction='none'  # [B, L]
+            )
+
+        elif self.loss_type == "mse":
+            # MSE drift matching loss
+            gamma_t = self.rdlm_schedule.get_gamma(t)
+            target_drift = compute_target_drift(xt, input_ids, gamma_t, self.vocab_size)
+
+            # Project model output to tangent space
+            predicted_drift = make_tangent(xt, logits)
+            token_loss = (predicted_drift - target_drift).square().sum(dim=-1)  # [B, L]
+
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        # Update metrics with raw loss (before masking)
+        self.meter.update(
+            split="train" if model.training else "eval",
+            value=(token_loss * loss_mask.float()).detach(),
+            weight=loss_mask.float().detach(),
+        )
+
+        # Apply loss mask
+        token_loss = token_loss * loss_mask.float()
+
+        # Normalize loss
+        if self.loss_norm_type == "token":
+            loss = token_loss.sum() / loss_mask.sum().clamp_min(1)
+        elif self.loss_norm_type == "sequence":
+            loss = token_loss.sum() / (loss_mask.sum(-1, keepdim=True).clamp_min(1) * B)
+            loss = loss.sum()
+        elif self.loss_norm_type == "batch":
+            loss = token_loss.sum() / B
+        else:
+            raise ValueError(f"Invalid loss_norm_type: {self.loss_norm_type}")
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+    @torch.no_grad()
+    def prediction_step(
+        self,
+        model,
+        inputs: Dict[str, torch.Tensor],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[list] = None,
+    ):
+        """
+        Evaluation step for RDLM using flow integration.
+        """
+        from dllm.pipelines.bert_rdlm.sampler import BertRDLMSampler, BertRDLMSamplerConfig
+
+        input_ids = inputs["input_ids"]
+        labels = inputs["labels"]
+        attention_mask = inputs.get("attention_mask", None)
+
+        B, L = input_ids.shape
+        unwrapped_model = model.module if hasattr(model, 'module') else model
+        vocab_size = unwrapped_model.config.vocab_size
+        device = input_ids.device
+
+        # Ensure schedule is initialized
+        self._ensure_schedule(device)
+
+        # Positions where we compute loss
+        loss_mask = labels != -100
+
+        # Get embedding layer
+        if hasattr(unwrapped_model, "get_input_embeddings"):
+            embed_layer = unwrapped_model.get_input_embeddings()
+        else:
+            embed_layer = unwrapped_model.model.embed_tokens
+        compute_dtype = embed_layer.weight.dtype
+
+        # Initialize sphere state
+        # For prompt positions: use one-hot on sphere
+        prompt_onehot = F.one_hot(input_ids, num_classes=vocab_size).float()
+        x_sphere = simplex_to_sphere(prompt_onehot)
+
+        # For flow positions: sample from RDLM prior
+        prior_sample = self.get_prior_samples(
+            (B, L, vocab_size), device, compute_dtype
+        )
+        x_sphere = torch.where(
+            loss_mask.unsqueeze(-1).expand_as(x_sphere),
+            prior_sample,
+            x_sphere,
+        )
+
+        # Get discrete embeddings for context
+        context_embeds = embed_layer(input_ids)
+
+        # Create sampler and config
+        sampler = BertRDLMSampler(
+            model=model,
+            tokenizer=self.processing_class,
+            rdlm_schedule=self.rdlm_schedule,
+        )
+        config = BertRDLMSamplerConfig(
+            n_steps=self.eval_integration_steps,
+            integrator="euler",
+            prior_type=self.prior_type,
+            schedule_type=self.schedule_config.schedule_type,
+            sigma_0=self.schedule_config.sigma_0,
+            sigma_T=self.schedule_config.sigma_T,
+            temperature=0.0,
+            embed_type=self.embed_type,
+        )
+
+        # Run flow integration
+        x_sphere = sampler.flow_integrate(
+            x_sphere=x_sphere,
+            flow_mask=loss_mask,
+            context_embeds=context_embeds,
+            attention_mask=attention_mask,
+            config=config,
+            time_embedding=self.time_embedding if self.use_time_embedding else None,
+        )
+
+        # Compute final loss
+        final_probs = sphere_to_simplex(x_sphere)
+        final_log_probs = torch.log(final_probs.clamp(min=1e-10))
+
+        token_nll = F.nll_loss(
+            final_log_probs.transpose(1, 2),
+            input_ids,
+            reduction="none",
+        )
+        token_nll = token_nll * loss_mask.float()
+
+        # Update metrics
+        self.meter.update(
+            split="eval",
+            value=token_nll.detach(),
+            weight=loss_mask.float().detach(),
+        )
+
+        loss = token_nll.sum() / loss_mask.sum().clamp_min(1)
+
+        if prediction_loss_only:
+            return (loss.detach(), None, None)
+
+        return (loss.detach(), None, labels.detach())
