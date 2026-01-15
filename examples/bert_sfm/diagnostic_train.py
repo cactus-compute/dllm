@@ -516,7 +516,6 @@ class DiagnosticBertSFMTrainer(BertSFMTrainer):
                     alpha_t_prime = torch.ones_like(t_curr)
                 else:
                     # Cosine schedule
-                    import math
                     alpha_t = 1 - torch.cos(math.pi / 2 * t_curr).square()
                     alpha_t_prime = math.pi / 2 * torch.sin(math.pi * t_curr)
                 step_weight = (alpha_t_prime * dt / (1 - alpha_t + 1e-5))
