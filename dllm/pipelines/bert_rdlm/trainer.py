@@ -68,6 +68,9 @@ class BertRDLMTrainerConfig(TrainingArguments):
     # instead of full integration. Useful for debugging.
     eval_simple: bool = False
 
+    # Use stochastic (Euler-Maruyama) integration for eval (RDLM default: True)
+    eval_stochastic: bool = True
+
     # Time embedding
     use_time_embedding: bool = False
     time_embedding_scale: float = 30.0
@@ -102,6 +105,7 @@ class BertRDLMTrainer(transformers.Trainer):
         self.time_eps = args.time_eps
         self.eval_integration_steps = args.eval_integration_steps
         self.eval_simple = args.eval_simple
+        self.eval_stochastic = args.eval_stochastic
         self.use_time_embedding = args.use_time_embedding
         self.time_embedding_scale = args.time_embedding_scale
 
@@ -479,6 +483,7 @@ class BertRDLMTrainer(transformers.Trainer):
                 sigma_T=self.schedule_config.sigma_T,
                 temperature=0.0,
                 embed_type=self.embed_type,
+                stochastic=self.eval_stochastic,
             )
 
             # Run flow integration

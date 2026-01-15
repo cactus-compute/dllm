@@ -63,8 +63,8 @@ class BertRDLMSamplerConfig(SamplerConfig):
     # Embedding
     embed_type: str = "spherical"  # "spherical" or "simplex"
 
-    # Whether to add stochastic noise during sampling
-    stochastic: bool = False
+    # Whether to add stochastic noise during sampling (RDLM uses grw/Euler-Maruyama)
+    stochastic: bool = True
 
 
 @dataclass
@@ -226,18 +226,27 @@ class BertRDLMSampler(BaseSampler):
                     # General geometric case
                     r = config.sigma_T / config.sigma_0
                     drift_coeff = math.log(r) / max(r ** (1 - t) - 1, 1e-8)
-                tangent = tangent * drift_coeff * dt
+                tangent = tangent * drift_coeff
+                # CRITICAL: RDLM applies to_tangent AFTER scaling by drift coefficient
+                # This ensures the drift stays on the tangent plane after scaling
+                tangent = make_tangent(x_sphere, tangent)
+                tangent = tangent * dt
             else:
                 tangent = tangent * dt
 
             # Add stochastic noise if enabled (Euler-Maruyama)
             # RDLM uses: sqrt(beta(t)) * z * sqrt(dt) where beta = sigma in our notation
-            # So total noise scale is sqrt(sigma_t * dt)
+            # diffusion = sqrt(beta(t)), so total noise scale is diffusion * sqrt(dt) = sqrt(beta(t) * dt)
             if config.stochastic:
                 sigma_t = sigma_fn(t_tensor)
+                diffusion = sigma_t.sqrt()  # RDLM's diffusion coefficient
                 noise = torch.randn_like(x_sphere)
-                noise = make_tangent(x_sphere, noise)
-                tangent = tangent + noise * (sigma_t * dt).sqrt()
+                # Don't project noise yet - RDLM doesn't project noise before adding
+                tangent = tangent + diffusion * noise * math.sqrt(dt)
+
+            # CRITICAL: Project final tangent vector before exp_map
+            # RDLM's exp() internally calls to_tangent before computing the exponential
+            tangent = make_tangent(x_sphere, tangent)
 
             # Take step via exponential map
             x_new = exp_map(x_sphere, tangent)
