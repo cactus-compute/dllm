@@ -81,8 +81,15 @@ class BertRDLMTrainerConfig(TrainingArguments):
     # instead of full integration. Useful for debugging.
     eval_simple: bool = False
 
-    # Use stochastic (Euler-Maruyama) integration for eval (RDLM default: True)
-    eval_stochastic: bool = True
+    # Use stochastic (Euler-Maruyama) integration for eval
+    # NOTE: For large vocabularies (BERT ~30k), stochastic=False is recommended
+    # because the noise-to-signal ratio scales with sqrt(vocab_size).
+    eval_stochastic: bool = False  # Changed default: use deterministic for large vocab
+
+    # Noise scaling for large vocabularies (only used when eval_stochastic=True)
+    # Scales noise by sqrt(reference_vocab_size / actual_vocab_size)
+    eval_noise_scaling: bool = True
+    eval_reference_vocab_size: int = 27  # text8 vocab size
 
     # Time embedding
     use_time_embedding: bool = False
@@ -134,6 +141,8 @@ class BertRDLMTrainer(transformers.Trainer):
         self.eval_integration_steps = args.eval_integration_steps
         self.eval_simple = args.eval_simple
         self.eval_stochastic = args.eval_stochastic
+        self.eval_noise_scaling = args.eval_noise_scaling
+        self.eval_reference_vocab_size = args.eval_reference_vocab_size
         self.use_time_embedding = args.use_time_embedding
         self.time_embedding_scale = args.time_embedding_scale
         self.self_consistency_prob = args.self_consistency_prob
@@ -624,6 +633,8 @@ class BertRDLMTrainer(transformers.Trainer):
                 temperature=0.0,
                 embed_type=self.embed_type,
                 stochastic=self.eval_stochastic,
+                noise_scaling=self.eval_noise_scaling,
+                reference_vocab_size=self.eval_reference_vocab_size,
                 mix_type=self.mix_type,
                 mix_step_thr=self.mix_step_thr,
             )

@@ -61,8 +61,19 @@ class BertRDLMSamplerConfig(SamplerConfig):
     # Embedding
     embed_type: str = "spherical"  # "spherical" or "simplex"
 
-    # Whether to add stochastic noise during sampling (RDLM uses grw/Euler-Maruyama)
-    stochastic: bool = True
+    # Stochastic sampling settings
+    # IMPORTANT: For large vocabularies (>1000), stochastic=False is recommended
+    # because the noise-to-signal ratio scales with sqrt(vocab_size), causing
+    # poor convergence. RDLM paper used V=27 (text8) where this wasn't an issue.
+    # For BERT-scale vocabularies (~30k), use deterministic (ODE) sampling or
+    # enable noise_scaling to compensate.
+    stochastic: bool = False  # Changed default: use deterministic for large vocab
+
+    # Noise scaling for large vocabularies (only used when stochastic=True)
+    # When True, scales noise by sqrt(reference_vocab_size / actual_vocab_size)
+    # to maintain similar noise-to-signal ratio as RDLM's text8 experiments.
+    noise_scaling: bool = True
+    reference_vocab_size: int = 27  # text8 vocab size (RDLM's reference)
 
     # Sampling eps (avoid t=1)
     sampling_eps: float = 1e-5
@@ -252,9 +263,20 @@ class BertRDLMSampler(BaseSampler):
             # Add stochastic noise if enabled (Euler-Maruyama)
             # RDLM uses: sqrt(beta(t)) * z * sqrt(dt) where beta = sigma in our notation
             # diffusion = sqrt(beta(t)), so total noise scale is diffusion * sqrt(dt) = sqrt(beta(t) * dt)
+            #
+            # CRITICAL: For large vocabularies, noise norm scales as sqrt(vocab_size) while
+            # drift norm stays constant. This causes the noise-to-signal ratio to explode.
+            # RDLM paper used V=27 (text8). For BERT (V~30k), we scale noise down to match.
             if config.stochastic:
                 sigma_t = sigma_fn(t_tensor)
                 diffusion = sigma_t.sqrt()  # RDLM's diffusion coefficient
+
+                # Apply noise scaling for large vocabularies
+                if config.noise_scaling:
+                    vocab_size = x_sphere.shape[-1]
+                    noise_scale = math.sqrt(config.reference_vocab_size / vocab_size)
+                    diffusion = diffusion * noise_scale
+
                 noise = torch.randn_like(x_sphere)
                 # Don't project noise yet - RDLM doesn't project noise before adding
                 tangent = tangent + diffusion * noise * math.sqrt(dt)
@@ -408,6 +430,8 @@ class BertRDLMSampler(BaseSampler):
             prediction_type=config.prediction_type,
             embed_type=config.embed_type,
             stochastic=config.stochastic,
+            noise_scaling=config.noise_scaling,
+            reference_vocab_size=config.reference_vocab_size,
             sampling_eps=config.sampling_eps,
         )
 
@@ -561,6 +585,8 @@ class BertRDLMSampler(BaseSampler):
             prediction_type=config.prediction_type,
             embed_type=config.embed_type,
             stochastic=config.stochastic,
+            noise_scaling=config.noise_scaling,
+            reference_vocab_size=config.reference_vocab_size,
             sampling_eps=config.sampling_eps,
         )
 

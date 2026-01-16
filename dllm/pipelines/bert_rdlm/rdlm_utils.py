@@ -450,26 +450,82 @@ def _coord_laplacian(x: torch.Tensor, t: torch.Tensor, scheduler, manifold_dim: 
 
 
 def _solve_rho(cos_norm: float, manifold_dim: int, init: float = 0.0) -> float:
-    """Solve rho from Kummer function inversion (rdlm/sde.py)."""
-    # For large dimensions, use analytic approximation to avoid numerical instability of hyp1f1
-    # E[cos] approx 1 - (D-1) * rho^2 / 2
-    # This approximation is accurate when rho is small and D is large
-    if manifold_dim > 100 and cos_norm > 0.1:
-        val = (2 * (1 - cos_norm) / (manifold_dim - 1))
-        if val > 0:
-            return math.sqrt(val)
-        return 0.0
+    """
+    Solve rho from Kummer function inversion (rdlm/sde.py).
 
+    For a Riemannian normal distribution on S^{D-1} with concentration parameter
+    related to rho, the expected cosine with the mean direction satisfies:
+        E[cos(theta)] = exp(-rho^2/2) * 1F1(D/2, 1/2, -rho^2/2)
+
+    For high-dimensional manifolds (D > 50), the hyp1f1 function becomes
+    numerically unstable. We use the von Mises-Fisher approximation instead:
+        E[cos(theta)] ≈ 1 - (D-1)*rho^2/2 + (D-1)*(D-3)*rho^4/24 - ...
+
+    This gives us a polynomial equation to solve for rho.
+    """
     import numpy as np
+
+    # Clamp cos_norm to valid range
+    cos_norm = max(min(cos_norm, 1.0 - 1e-10), -1.0 + 1e-10)
+
+    # Edge cases
+    if cos_norm >= 1.0 - 1e-8:
+        return 0.0  # Very concentrated, rho ≈ 0
+
+    if cos_norm <= 0.0:
+        # For spread-out distributions, use the asymptotic limit
+        # When rho is large, E[cos] → 0 on high-dim sphere
+        # Approximate: E[cos] ≈ exp(-D*rho^2/4) for large rho
+        # Solving: cos_norm = exp(-D*rho^2/4) → rho = sqrt(-4*log(max(cos_norm,1e-10))/D)
+        if cos_norm <= 1e-10:
+            return math.sqrt(4.0 * 10.0 / max(manifold_dim, 1))  # Cap at reasonable value
+        return math.sqrt(-4.0 * math.log(cos_norm) / max(manifold_dim, 1))
+
+    # For high dimensions, use first-order approximation from Taylor expansion
+    # E[cos] = exp(-rho^2/2) * 1F1(D/2, 1/2, -rho^2/2) ≈ 1 - (D-1)*rho^2/2 + O(rho^4)
+    # Solving for rho: rho = sqrt(2*(1-E[cos])/(D-1))
+    if manifold_dim > 50:
+        D = manifold_dim
+        rho_sq = 2.0 * (1.0 - cos_norm) / max(D - 1, 1)
+        if rho_sq <= 0:
+            return 0.0
+        return math.sqrt(rho_sq)
+
     import scipy.special as sp
-    from scipy.optimize import fsolve
+    from scipy.optimize import brentq
 
     def f(rho):
-        lhs = np.exp(-rho ** 2 / 2) * sp.hyp1f1(manifold_dim / 2, 0.5, -rho ** 2 / 2)
+        if rho <= 1e-10:
+            return 1.0 - cos_norm
+        log_exp_term = -rho ** 2 / 2.0
+        hyp_val = sp.hyp1f1(manifold_dim / 2.0, 0.5, -rho ** 2 / 2.0)
+
+        # Check for numerical issues - use approximation if hyp1f1 fails
+        if not np.isfinite(hyp_val) or hyp_val <= 0:
+            return (1.0 - (manifold_dim - 1) * rho ** 2 / 2.0) - cos_norm
+
+        lhs = math.exp(log_exp_term) * hyp_val
         return lhs - cos_norm
 
-    rho = fsolve(f, init)
-    return float(np.abs(rho).item())
+    # Use first-order approximation as initial guess
+    init_guess = math.sqrt(2.0 * (1.0 - cos_norm) / max(manifold_dim - 1, 1))
+    init_guess = max(init_guess, 1e-6)
+
+    # Find upper bound where f changes sign
+    upper = max(init_guess * 3, 0.5)
+    for _ in range(15):
+        if f(upper) < 0:
+            break
+        upper *= 2
+        if upper > 10:
+            return init_guess  # Couldn't bracket, use approximation
+
+    if f(upper) >= 0:
+        return init_guess  # Couldn't bracket, use approximation
+
+    # Use Brent's method - guaranteed to converge if properly bracketed
+    rho = brentq(f, 1e-10, upper, xtol=1e-8)
+    return float(rho)
 
 
 def _precompute_alpha_rho_init(
@@ -528,13 +584,22 @@ def _precompute_alpha_rho_init(
         proj_f[i + 1] = x[..., 0].mean()
         proj_0[i + 1] = x[..., 1].mean()
 
-    rtheta = proj_f / proj_0
+    # Moment matching to get alphas (Eq. 25 in RDLM paper)
+    # Clamp proj_0 to avoid division by zero
+    rtheta = proj_f / proj_0.clamp(min=eps)
     rtheta = (rtheta - inner_prod) ** 2
-    alphas = (rtheta / (1 - inner_prod ** 2 + rtheta)).sqrt()
+    # Ensure denominator is positive and clamp rtheta to be non-negative
+    rtheta = rtheta.clamp(min=0)
+    denom = (1 - inner_prod ** 2 + rtheta).clamp(min=eps)
+    alphas = (rtheta / denom).clamp(min=0, max=1).sqrt()
 
-    cos_norm_start = proj_0.clamp(min=eps) / (1 - alphas ** 2).sqrt().clamp(min=eps)
-    cos_norm_end = proj_f / (proj_norm * alphas + inner_prod * (1 - alphas ** 2).sqrt())
+    # Compute cos_norm for rho calculation
+    one_minus_alpha_sq = (1 - alphas ** 2).clamp(min=eps)
+    cos_norm_start = proj_0.clamp(min=eps) / one_minus_alpha_sq.sqrt().clamp(min=eps)
+    cos_norm_end = proj_f / (proj_norm * alphas + inner_prod * one_minus_alpha_sq.sqrt()).clamp(min=eps)
     cos_norm = torch.cat([cos_norm_start[: len(alphas) // 2], cos_norm_end[len(alphas) // 2 :]], dim=0)
+    # Clamp cos_norm to valid range for _solve_rho
+    cos_norm = cos_norm.clamp(min=-1.0 + eps, max=1.0 - eps)
 
     rhos = [0.0]
     for i in tqdm(range(1, len(cos_norm)), leave=False, disable=not _is_main_process()):
@@ -613,19 +678,27 @@ def _precompute_alpha_rho_mixture(
         proj_f[1, i + 1] = x[..., 2].mean()
         proj_0[1, i + 1] = x[..., 3].mean()
 
+    # Moment matching for mask path
     rtheta = proj_0[0] / proj_f[0].clamp(min=eps)
-    alphas_mask = 1 / (1 + rtheta ** 2).sqrt()
-    cos_norm_mask = proj_f[0].clamp(min=eps) / alphas_mask
+    alphas_mask = 1 / (1 + rtheta ** 2).clamp(min=eps).sqrt()
+    alphas_mask = alphas_mask.clamp(min=0, max=1)
+    cos_norm_mask = proj_f[0].clamp(min=eps) / alphas_mask.clamp(min=eps)
+    cos_norm_mask = cos_norm_mask.clamp(min=-1.0 + eps, max=1.0 - eps)
 
-    rtheta_unif = proj_f[1] / proj_0[1]
+    # Moment matching for uniform path
+    rtheta_unif = proj_f[1] / proj_0[1].clamp(min=eps)
     rtheta_unif = (rtheta_unif - inner_prod) ** 2
-    alphas_unif = (rtheta_unif / (1 - inner_prod ** 2 + rtheta_unif)).sqrt()
+    rtheta_unif = rtheta_unif.clamp(min=0)
+    denom_unif = (1 - inner_prod ** 2 + rtheta_unif).clamp(min=eps)
+    alphas_unif = (rtheta_unif / denom_unif).clamp(min=0, max=1).sqrt()
 
-    cos_norm_start = proj_0[1].clamp(min=eps) / (1 - alphas_unif ** 2).sqrt().clamp(min=eps)
-    cos_norm_end = proj_f[1] / (proj_norm * alphas_unif + inner_prod * (1 - alphas_unif ** 2).sqrt())
+    one_minus_alpha_unif_sq = (1 - alphas_unif ** 2).clamp(min=eps)
+    cos_norm_start = proj_0[1].clamp(min=eps) / one_minus_alpha_unif_sq.sqrt().clamp(min=eps)
+    cos_norm_end = proj_f[1] / (proj_norm * alphas_unif + inner_prod * one_minus_alpha_unif_sq.sqrt()).clamp(min=eps)
     cos_norm_unif = torch.cat(
         [cos_norm_start[: len(alphas_unif) // 2], cos_norm_end[len(alphas_unif) // 2 :]], dim=0
     )
+    cos_norm_unif = cos_norm_unif.clamp(min=-1.0 + eps, max=1.0 - eps)
 
     rhos_mask = [0.0]
     for i in tqdm(range(1, len(cos_norm_mask)), leave=False, disable=not _is_main_process()):
