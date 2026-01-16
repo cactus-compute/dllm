@@ -129,6 +129,7 @@ class BertRDLMTrainerConfig(TrainingArguments):
 
     # Evaluation - RDLM uses 256 for text8, 1000 for lm1b
     eval_integration_steps: int = 256
+    eval_temperature: float = 0.0
 
     # Use simplified eval that matches training (single forward pass at random t)
     # instead of full integration. Useful for debugging.
@@ -192,6 +193,7 @@ class BertRDLMTrainer(transformers.Trainer):
         self.embed_type = args.embed_type
         self.time_eps = args.time_eps
         self.eval_integration_steps = args.eval_integration_steps
+        self.eval_temperature = args.eval_temperature
         self.eval_simple = args.eval_simple
         self.eval_stochastic = args.eval_stochastic
         self.eval_noise_scaling = args.eval_noise_scaling
@@ -695,7 +697,7 @@ class BertRDLMTrainer(transformers.Trainer):
                 schedule_type=self.schedule_config.schedule_type,
                 sigma_0=self.schedule_config.sigma_0,
                 sigma_T=self.schedule_config.sigma_T,
-                temperature=0.0,
+                temperature=self.eval_temperature,
                 embed_type=self.embed_type,
                 stochastic=self.eval_stochastic,
                 noise_scaling=self.eval_noise_scaling,
