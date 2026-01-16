@@ -473,11 +473,14 @@ class BertRDLMTrainer(transformers.Trainer):
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
         # Update metrics with raw loss (before importance weighting and masking)
-        self.meter.update(
-            split="train" if model.training else "eval",
-            value=(token_loss * loss_mask.float()).detach(),
-            weight=loss_mask.float().detach(),
-        )
+        # Only update train metrics here - eval metrics are handled by prediction_step
+        # to avoid mixing training-style loss (random t) with integration-style loss
+        if model.training:
+            self.meter.update(
+                split="train",
+                value=(token_loss * loss_mask.float()).detach(),
+                weight=loss_mask.float().detach(),
+            )
 
         # Importance weight for RDLM (applied after metrics update to keep metrics unweighted)
         weight = self.rdlm_schedule.importance_weight(t, model.training).view(B, 1)
