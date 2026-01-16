@@ -263,7 +263,7 @@ class BertRDLMTrainer(transformers.Trainer):
         **kwargs
     ):
         """
-        Compute RDLM training loss (memory-optimized).
+        Compute RDLM training loss.
 
         Args:
             model: the model being trained
@@ -299,6 +299,7 @@ class BertRDLMTrainer(transformers.Trainer):
         loss_mask = labels != -100  # [b, l]
 
         # Get embedding layer and compute dtype
+        unwrapped_model = model.module if hasattr(model, 'module') else model
         if hasattr(unwrapped_model, "get_input_embeddings"):
             embed_layer = unwrapped_model.get_input_embeddings()
         else:
@@ -313,31 +314,27 @@ class BertRDLMTrainer(transformers.Trainer):
         else:
             t = (1 - eps) * torch.rand(B, device=device)
 
-        # Sample from prior and interpolate in one block to minimize peak memory
+        # Sample from prior
         x0 = self.get_prior_samples((B, L, self.rdlm_vocab_size), device, compute_dtype, t)
-        xt = self.interpolate(x0, input_ids, t)
-        del x0  # Free memory immediately
 
-        # Keep prompt positions clean (not noised) - in-place where possible
+        # Get interpolated samples
+        xt = self.interpolate(x0, input_ids, t)
+        del x0  # Free memory
+
+        # Keep prompt positions clean (not noised)
         if not loss_mask.all():
             prompt_mask = ~loss_mask
-            # Zero out and set one-hot in-place
             xt[prompt_mask] = 0
-            xt[prompt_mask] = xt[prompt_mask].scatter(-1, input_ids[prompt_mask].unsqueeze(-1), 1.0)
+            prompt_indices = input_ids[prompt_mask].unsqueeze(-1)
+            xt[prompt_mask] = xt[prompt_mask].scatter(-1, prompt_indices, 1.0)
 
-        # Compute soft embeddings - slice before matmul to save memory
-        if self.embed_type == "spherical":
-            x_embed = xt[..., :self.model_vocab_size] if xt.shape[-1] > self.model_vocab_size else xt
-        else:
-            x_embed = sphere_to_simplex(xt)
-            if x_embed.shape[-1] > self.model_vocab_size:
-                x_embed = x_embed[..., :self.model_vocab_size]
-
+        # Compute soft embeddings
+        x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
+        if x_embed.shape[-1] > self.model_vocab_size:
+            x_embed = x_embed[..., : self.model_vocab_size]
         soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
-
-        # Free xt and x_embed if we don't need them for MSE loss
-        if self.loss_type == "ce":
-            del xt, x_embed
+        if x_embed is not xt:
+            del x_embed  # Free if we created a new tensor
 
         # Add time embedding if enabled
         if self.use_time_embedding:
@@ -363,39 +360,32 @@ class BertRDLMTrainer(transformers.Trainer):
 
         # Compute loss based on loss type
         if self.loss_type == "ce":
-            # Cross-entropy loss - compute in-place where possible
+            # Cross-entropy loss
             token_loss = F.cross_entropy(
                 logits.transpose(1, 2),  # [B, V, L]
                 input_ids,  # [B, L]
                 reduction='none'  # [B, L]
             )
-            del logits
 
         elif self.loss_type == "mse":
             # MSE drift matching loss (ELBO)
             drift_coeff = self.rdlm_schedule.get_gamma(t)
             target_drift = compute_target_drift(xt, input_ids, drift_coeff, self.rdlm_vocab_size)
 
-            # Compute probs and pad if needed
             probs = F.softmax(logits.to(torch.float32), dim=-1)
-            del logits
             if probs.shape[-1] < xt.shape[-1]:
                 pad = xt.shape[-1] - probs.shape[-1]
                 probs = torch.cat([probs, probs.new_zeros(*probs.shape[:-1], pad)], dim=-1)
 
             predicted_drift = expected_logmap_to_onehots(xt, probs, positive_orthant=False)
-            del probs
             predicted_drift = predicted_drift * drift_coeff.view(-1, 1, 1)
             predicted_drift = make_tangent(xt, predicted_drift)
 
             diff = predicted_drift - target_drift
-            del predicted_drift, target_drift
             token_loss = 0.5 * diff.square().sum(dim=-1)
-            del diff
 
             beta_t = self.rdlm_schedule.get_sigma(t)
             token_loss = token_loss / beta_t.view(-1, 1).clamp(min=1e-8)
-            del xt
 
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
@@ -411,9 +401,10 @@ class BertRDLMTrainer(transformers.Trainer):
             weight=loss_mask.float().detach(),
         )
 
-        # Apply loss mask and normalize
+        # Apply loss mask
         token_loss = token_loss * loss_mask.float()
 
+        # Normalize loss
         if self.loss_norm_type == "token":
             loss = token_loss.sum() / loss_mask.sum().clamp_min(1)
         elif self.loss_norm_type == "sequence":
