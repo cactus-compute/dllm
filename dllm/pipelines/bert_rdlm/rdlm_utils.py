@@ -26,6 +26,46 @@ def _is_main_process() -> bool:
     rank = os.environ.get("RANK", "0")
     return local_rank == "0" and rank == "0"
 
+
+def _log_cos_norm_stats(name: str, cos_norm: torch.Tensor) -> None:
+    """Log cos_norm range for precompute sanity checks."""
+    if not _is_main_process():
+        return
+    if not isinstance(cos_norm, torch.Tensor):
+        return
+    with torch.no_grad():
+        vals = cos_norm.detach()
+        min_val = vals.min().item()
+        median_val = vals.median().item()
+        mean_val = vals.mean().item()
+        max_val = vals.max().item()
+    print(
+        f"[rdlm_utils] cos_norm stats ({name}): "
+        f"min={min_val:.6f} median={median_val:.6f} mean={mean_val:.6f} max={max_val:.6f}"
+    )
+
+
+def _debug_precompute_enabled() -> bool:
+    return os.environ.get("RDLM_DEBUG_PRECOMPUTE", "0") == "1"
+
+
+def _log_tensor_stats(name: str, tensor: torch.Tensor) -> None:
+    """Log tensor stats for precompute debugging."""
+    if not _is_main_process() or not _debug_precompute_enabled():
+        return
+    if not isinstance(tensor, torch.Tensor):
+        return
+    with torch.no_grad():
+        vals = tensor.detach()
+        nonfinite = (~torch.isfinite(vals)).sum().item()
+        min_val = vals.min().item()
+        mean_val = vals.mean().item()
+        max_val = vals.max().item()
+    print(
+        f"[rdlm_utils] {name}: "
+        f"min={min_val:.6f} mean={mean_val:.6f} max={max_val:.6f} nonfinite={nonfinite}"
+    )
+
 # Reuse geodesic utilities from bert_sfm
 from dllm.pipelines.bert_sfm.geodesic_utils import (
     exp_map_inplace,
@@ -557,6 +597,7 @@ def _precompute_alpha_rho_init(
 
     timesteps = torch.linspace(0.0, 1.0, preprocess_steps, device=device)
     dt = timesteps[1] - timesteps[0]
+    debug_interval = int(os.environ.get("RDLM_DEBUG_PRECOMPUTE_INTERVAL", "200"))
 
     iterator = tqdm(range(0, timesteps.shape[0] - 2), desc="Precomputing init", leave=False, disable=not _is_main_process())
     for i in iterator:
@@ -584,6 +625,10 @@ def _precompute_alpha_rho_init(
         proj_f[i + 1] = x[..., 0].mean()
         proj_0[i + 1] = x[..., 1].mean()
 
+        if _debug_precompute_enabled() and i % debug_interval == 0:
+            _log_tensor_stats("init_x0", x[..., 0])
+            _log_tensor_stats("init_x1", x[..., 1])
+
     # Moment matching to get alphas (Eq. 25 in RDLM paper)
     # Clamp proj_0 to avoid division by zero
     rtheta = proj_f / proj_0.clamp(min=eps)
@@ -593,13 +638,20 @@ def _precompute_alpha_rho_init(
     denom = (1 - inner_prod ** 2 + rtheta).clamp(min=eps)
     alphas = (rtheta / denom).clamp(min=0, max=1).sqrt()
 
+    if _debug_precompute_enabled():
+        _log_tensor_stats("init_proj_f", proj_f)
+        _log_tensor_stats("init_proj_0", proj_0)
+        _log_tensor_stats("init_alphas", alphas)
+
     # Compute cos_norm for rho calculation
     one_minus_alpha_sq = (1 - alphas ** 2).clamp(min=eps)
     cos_norm_start = proj_0.clamp(min=eps) / one_minus_alpha_sq.sqrt().clamp(min=eps)
     cos_norm_end = proj_f / (proj_norm * alphas + inner_prod * one_minus_alpha_sq.sqrt()).clamp(min=eps)
     cos_norm = torch.cat([cos_norm_start[: len(alphas) // 2], cos_norm_end[len(alphas) // 2 :]], dim=0)
+    _log_cos_norm_stats("init_raw", cos_norm)
     # Clamp cos_norm to valid range for _solve_rho
     cos_norm = cos_norm.clamp(min=-1.0 + eps, max=1.0 - eps)
+    _log_cos_norm_stats("init_clamped", cos_norm)
 
     rhos = [0.0]
     for i in tqdm(range(1, len(cos_norm)), leave=False, disable=not _is_main_process()):
@@ -641,6 +693,7 @@ def _precompute_alpha_rho_mixture(
     )
     timesteps = torch.linspace(0.0, 1.0, preprocess_steps, device=device)
     dt = timesteps[1] - timesteps[0]
+    debug_interval = int(os.environ.get("RDLM_DEBUG_PRECOMPUTE_INTERVAL", "200"))
 
     iterator = tqdm(range(0, timesteps.shape[0] - 2), desc="Precomputing mixture", leave=False, disable=not _is_main_process())
     for i in iterator:
@@ -678,12 +731,25 @@ def _precompute_alpha_rho_mixture(
         proj_f[1, i + 1] = x[..., 2].mean()
         proj_0[1, i + 1] = x[..., 3].mean()
 
+        if _debug_precompute_enabled() and i % debug_interval == 0:
+            _log_tensor_stats("mix_x0", x[..., 0])
+            _log_tensor_stats("mix_x1", x[..., 1])
+            _log_tensor_stats("mix_x2", x[..., 2])
+            _log_tensor_stats("mix_x3", x[..., 3])
+
     # Moment matching for mask path
     rtheta = proj_0[0] / proj_f[0].clamp(min=eps)
     alphas_mask = 1 / (1 + rtheta ** 2).clamp(min=eps).sqrt()
     alphas_mask = alphas_mask.clamp(min=0, max=1)
     cos_norm_mask = proj_f[0].clamp(min=eps) / alphas_mask.clamp(min=eps)
+
+    if _debug_precompute_enabled():
+        _log_tensor_stats("mix_proj_f_mask", proj_f[0])
+        _log_tensor_stats("mix_proj_0_mask", proj_0[0])
+        _log_tensor_stats("mix_alphas_mask", alphas_mask)
+    _log_cos_norm_stats("mixture_mask_raw", cos_norm_mask)
     cos_norm_mask = cos_norm_mask.clamp(min=-1.0 + eps, max=1.0 - eps)
+    _log_cos_norm_stats("mixture_mask_clamped", cos_norm_mask)
 
     # Moment matching for uniform path
     rtheta_unif = proj_f[1] / proj_0[1].clamp(min=eps)
@@ -692,13 +758,20 @@ def _precompute_alpha_rho_mixture(
     denom_unif = (1 - inner_prod ** 2 + rtheta_unif).clamp(min=eps)
     alphas_unif = (rtheta_unif / denom_unif).clamp(min=0, max=1).sqrt()
 
+    if _debug_precompute_enabled():
+        _log_tensor_stats("mix_proj_f_unif", proj_f[1])
+        _log_tensor_stats("mix_proj_0_unif", proj_0[1])
+        _log_tensor_stats("mix_alphas_unif", alphas_unif)
+
     one_minus_alpha_unif_sq = (1 - alphas_unif ** 2).clamp(min=eps)
     cos_norm_start = proj_0[1].clamp(min=eps) / one_minus_alpha_unif_sq.sqrt().clamp(min=eps)
     cos_norm_end = proj_f[1] / (proj_norm * alphas_unif + inner_prod * one_minus_alpha_unif_sq.sqrt()).clamp(min=eps)
     cos_norm_unif = torch.cat(
         [cos_norm_start[: len(alphas_unif) // 2], cos_norm_end[len(alphas_unif) // 2 :]], dim=0
     )
+    _log_cos_norm_stats("mixture_unif_raw", cos_norm_unif)
     cos_norm_unif = cos_norm_unif.clamp(min=-1.0 + eps, max=1.0 - eps)
+    _log_cos_norm_stats("mixture_unif_clamped", cos_norm_unif)
 
     rhos_mask = [0.0]
     for i in tqdm(range(1, len(cos_norm_mask)), leave=False, disable=not _is_main_process()):
@@ -728,7 +801,7 @@ def precompute_alpha_rho(
     manifold_dim: Optional[int] = None,
     mix_type: Optional[str] = None,
     mix_step_thr: float = 0.0,
-    rho_scale: float = 1.0,
+    rho_scale: float = 10.0,
     init_lambda: Optional[float] = None,
     preprocess_dims: int = 2 ** 14,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -821,11 +894,11 @@ class RDLMScheduleConfig:
     init_lambda: Optional[float] = None
     mix_type: str = "step"
     mix_step_thr: float = 0.0
-    rho_scale: float = 1.0
+    rho_scale: float = 10.0
     preprocess_dims: int = 2 ** 14
     weight_type: str = "step"
-    weight_left: float = 0.3
-    weight_right: float = 0.75
+    weight_left: float = 0.0
+    weight_right: float = 0.2
     weight_lb: float = 1e-4
     weight_ub: float = 1.0
     eps: float = 1e-6
@@ -850,7 +923,7 @@ class RDLMSchedule:
         init_lambda: Optional[float] = None,
         mix_type: str = "step",
         mix_step_thr: float = 0.0,
-        rho_scale: float = 1.0,
+        rho_scale: float = 10.0,
         preprocess_dims: int = 2 ** 14,
         weight_type: str = "step",
         weight_left: float = 0.3,

@@ -54,10 +54,10 @@ class BertRDLMTrainerConfig(TrainingArguments):
     sigma_T: float = 0.2    # beta_f in RDLM (paper uses 0.2, not 1.0)
     n_time_steps: int = 10000  # preprocess_steps in RDLM paper
     preprocess_dims: int = 2 ** 14
-    rho_scale: float = 1.0
+    rho_scale: float = 10.0
     weight_type: str = "step"
-    weight_left: float = 0.3
-    weight_right: float = 0.75
+    weight_left: float = 0.0
+    weight_right: float = 0.2
     weight_lb: float = 1e-4
     weight_ub: float = 1.0
 
