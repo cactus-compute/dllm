@@ -138,6 +138,21 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
     best_eval = min(eval_entries, key=lambda e: e.get("eval_loss", float("inf")))
     best_step = best_eval.get("step", 0)
 
+    # Get eval_ppl (often logged in a separate entry by the meter callback at the same step)
+    eval_ppl = best_eval.get("eval_ppl")
+    if eval_ppl is None:
+        # Search for an entry at the same step that has eval_ppl
+        ppl_entries = [e for e in log_history if "eval_ppl" in e and e.get("step") == best_step]
+        if ppl_entries:
+            eval_ppl = ppl_entries[0].get("eval_ppl")
+        else:
+            # Fallback: compute from eval_loss (which is NLL in our prediction_step)
+            import math
+            try:
+                eval_ppl = math.exp(best_eval["eval_loss"])
+            except OverflowError:
+                eval_ppl = float('inf')
+
     # Get train nll at best step (raw loss before weighting, from meter)
     train_nll = None
     if train_nll_entries:
@@ -146,7 +161,7 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
 
     metrics = {
         "best_eval_loss": best_eval.get("eval_loss"),
-        "best_eval_ppl": best_eval.get("eval_ppl", "N/A"),
+        "best_eval_ppl": eval_ppl,
         "best_step": best_step,
         "train_nll": train_nll,
     }
