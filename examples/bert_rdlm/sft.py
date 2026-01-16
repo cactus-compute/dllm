@@ -88,7 +88,7 @@ class TrainingArguments(BertRDLMTrainerConfig):
     schedule_type: str = "geometric"
     sigma_0: float = 0.001  # beta_0 in RDLM
     sigma_T: float = 0.2    # beta_f in RDLM (paper uses 0.2, not 1.0)
-    n_time_steps: int = 1000
+    n_time_steps: int = 10000
     use_riemannian_normal: bool = True
 
     # Loss configuration
@@ -233,7 +233,7 @@ def train():
                     tokenizer,
                     return_tensors="pt",
                     padding=True,
-                    label_pad_token_id=tokenizer.pad_token_id,
+                    label_pad_token_id=-100,
                 ),
             )
         ),

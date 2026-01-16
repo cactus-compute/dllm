@@ -90,9 +90,11 @@ class TimeEmbedding(nn.Module):
 
 def exp_map(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
-    Exponential map on the sphere.
+    Exponential map on the sphere with Taylor expansion for numerical stability.
 
     Move from point p in direction v (tangent vector) on the sphere.
+    Uses Taylor expansion when ||v|| is small to avoid numerical issues,
+    matching the reference RDLM implementation.
 
     Args:
         p: Point on the sphere, shape (..., D)
@@ -101,8 +103,30 @@ def exp_map(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     Returns:
         New point on the sphere, shape (..., D)
     """
-    v_norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=1e-8)
-    return p * torch.cos(v_norm) + v * torch.sin(v_norm) / v_norm
+    norm2 = (v * v).sum(dim=-1, keepdim=True)
+    norm = norm2.sqrt()
+
+    # Taylor expansion coefficients for small norms:
+    # cos(x) ≈ 1 - x²/2 + x⁴/24
+    # sinc(x) = sin(x)/x ≈ 1 - x²/6 + x⁴/120
+    # Use Taylor expansion when norm² < 1e-4 (norm < 0.01)
+    small_norm = norm2 < 1e-4
+
+    # Compute cos coefficient: cos(norm) for large, Taylor for small
+    cos_coeff = torch.where(
+        small_norm,
+        1.0 - norm2 / 2.0 + norm2 * norm2 / 24.0,
+        torch.cos(norm)
+    )
+
+    # Compute sinc coefficient: sin(norm)/norm for large, Taylor for small
+    sinc_coeff = torch.where(
+        small_norm,
+        1.0 - norm2 / 6.0 + norm2 * norm2 / 120.0,
+        torch.sin(norm) / norm.clamp(min=1e-8)
+    )
+
+    return p * cos_coeff + v * sinc_coeff
 
 
 def exp_map_inplace(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -110,6 +134,7 @@ def exp_map_inplace(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     Memory-efficient exponential map that reuses the v tensor.
 
     Computes exp_map(p, v) but stores the result in v to save memory.
+    Uses Taylor expansion for numerical stability when ||v|| is small.
     WARNING: This destroys the contents of v.
 
     Args:
@@ -119,11 +144,26 @@ def exp_map_inplace(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     Returns:
         v tensor now containing the result (same memory location)
     """
-    v_norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=1e-8)
-    sin_norm = torch.sin(v_norm)
-    cos_norm = torch.cos(v_norm)
-    # v = v * sin(||v||) / ||v|| + p * cos(||v||)
-    v.mul_(sin_norm).div_(v_norm).add_(p * cos_norm)
+    norm2 = (v * v).sum(dim=-1, keepdim=True)
+    norm = norm2.sqrt()
+
+    # Taylor expansion for small norms
+    small_norm = norm2 < 1e-4
+
+    cos_coeff = torch.where(
+        small_norm,
+        1.0 - norm2 / 2.0 + norm2 * norm2 / 24.0,
+        torch.cos(norm)
+    )
+
+    sinc_coeff = torch.where(
+        small_norm,
+        1.0 - norm2 / 6.0 + norm2 * norm2 / 120.0,
+        torch.sin(norm) / norm.clamp(min=1e-8)
+    )
+
+    # v = v * sinc_coeff + p * cos_coeff
+    v.mul_(sinc_coeff).add_(p * cos_coeff)
     return v
 
 

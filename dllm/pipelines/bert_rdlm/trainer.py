@@ -7,6 +7,7 @@ Extends BertSFMTrainer with RDLM-specific:
 - Geometric noise schedule
 """
 
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,7 +43,7 @@ class BertRDLMTrainerConfig(TrainingArguments):
     prior_type: str = "mixture"  # "uniform", "masked", or "mixture"
     mixing_prob: float = 0.5    # Probability of uniform state in mixture prior
     mask_idx: int = -1          # Index of mask token (-1 = use tokenizer's mask_token_id)
-    add_mask_token: bool = False  # False = use existing [MASK] in vocab, no extra dimension
+    add_mask_token: bool = True  # True = add extra mask dimension (RDLM default)
     init_lambda: Optional[float] = None
     mix_type: str = "step"
     mix_step_thr: float = 0.0
@@ -86,6 +87,10 @@ class BertRDLMTrainerConfig(TrainingArguments):
     # Time embedding
     use_time_embedding: bool = False
     time_embedding_scale: float = 30.0
+
+    # Self-consistency: expose model to off-bridge states during training
+    self_consistency_prob: float = 0.1
+    self_consistency_noise_scale: float = 0.1
 
 
 class BertRDLMTrainer(transformers.Trainer):
@@ -131,6 +136,8 @@ class BertRDLMTrainer(transformers.Trainer):
         self.eval_stochastic = args.eval_stochastic
         self.use_time_embedding = args.use_time_embedding
         self.time_embedding_scale = args.time_embedding_scale
+        self.self_consistency_prob = args.self_consistency_prob
+        self.self_consistency_noise_scale = args.self_consistency_noise_scale
 
         # Get vocab size from model
         unwrapped_model = model.module if hasattr(model, 'module') else model
@@ -145,7 +152,11 @@ class BertRDLMTrainer(transformers.Trainer):
         if self.add_mask_token:
             self.mask_idx = self.rdlm_vocab_size - 1
         else:
-            self.mask_idx = args.mask_idx if args.mask_idx != -1 else self.model_vocab_size - 1
+            if args.mask_idx != -1:
+                self.mask_idx = args.mask_idx
+            else:
+                tokenizer_mask = getattr(self.processing_class, "mask_token_id", None)
+                self.mask_idx = tokenizer_mask if tokenizer_mask is not None else self.model_vocab_size - 1
 
         # Initialize RDLM schedule with precomputed values
         # Note: We defer device placement until first compute_loss call
@@ -255,6 +266,38 @@ class BertRDLMTrainer(transformers.Trainer):
             # Fall back to geodesic interpolation
             return geodesic_interpolant_to_onehot(x0, target_indices, t)
 
+    def _add_tangent_noise(
+        self,
+        xt: torch.Tensor,
+        t: torch.Tensor,
+        loss_mask: torch.Tensor,
+        noise_scale: float,
+    ) -> torch.Tensor:
+        """
+        Add tangent-space noise at xt to expose the model to off-bridge states.
+
+        Args:
+            xt: Current state on sphere, shape (B, L, V)
+            t: Time values, shape (B,)
+            loss_mask: Boolean mask for flow positions (True = flow)
+            noise_scale: Base noise scale
+
+        Returns:
+            Perturbed state on sphere, shape (B, L, V)
+        """
+        b, l, _ = xt.shape
+        noise = torch.randn_like(xt)
+        tangent_noise = make_tangent(xt, noise)
+
+        t_expanded = t.view(b, 1, 1)
+        scaled_noise = tangent_noise * t_expanded * noise_scale
+
+        xt_noisy = exp_map(xt, scaled_noise)
+        xt_noisy = xt_noisy / torch.norm(xt_noisy, dim=-1, keepdim=True).clamp(min=1e-8)
+
+        flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(xt)
+        return torch.where(flow_mask_expanded, xt_noisy, xt)
+
     def compute_loss(
         self,
         model,
@@ -324,9 +367,21 @@ class BertRDLMTrainer(transformers.Trainer):
             xt[prompt_mask] = 0
             xt[prompt_mask] = xt[prompt_mask].scatter(-1, input_ids[prompt_mask].unsqueeze(-1), 1.0)
 
+        # Self-consistency: optionally perturb xt to expose off-bridge states
+        if (
+            self.self_consistency_prob > 0
+            and model.training
+            and random.random() < self.self_consistency_prob
+        ):
+            xt = self._add_tangent_noise(xt, t, loss_mask, self.self_consistency_noise_scale)
+
         # Compute soft embeddings
         x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
-        soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
+        if self.add_mask_token and x_embed.shape[-1] > self.model_vocab_size:
+            x_embed_model = x_embed[..., :self.model_vocab_size]
+        else:
+            x_embed_model = x_embed
+        soft_embeddings = torch.matmul(x_embed_model.to(compute_dtype), embed_layer.weight)
 
         # Free xt and x_embed if we don't need them for MSE loss
         if self.loss_type == "ce":
@@ -487,7 +542,11 @@ class BertRDLMTrainer(transformers.Trainer):
 
             # Compute soft embeddings
             x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
-            soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
+            if self.add_mask_token and x_embed.shape[-1] > self.model_vocab_size:
+                x_embed_model = x_embed[..., :self.model_vocab_size]
+            else:
+                x_embed_model = x_embed
+            soft_embeddings = torch.matmul(x_embed_model.to(compute_dtype), embed_layer.weight)
 
             # Add time embedding if enabled
             if self.use_time_embedding and self.time_embedding is not None:

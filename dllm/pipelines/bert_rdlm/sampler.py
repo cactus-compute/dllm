@@ -45,8 +45,8 @@ class BertRDLMSamplerConfig(SamplerConfig):
     # Prior
     prior_type: str = "mixture"  # "uniform", "masked", "mixture"
     mixing_prob: float = 0.5  # Probability of uniform state in mixture prior
-    mask_idx: int = -1  # -1 = use tokenizer's mask_token_id
-    add_mask_token: bool = False  # False = use existing [MASK] in vocab
+    mask_idx: int = -1  # -1 = use tokenizer's mask_token_id when available
+    add_mask_token: bool = True  # True = add extra mask dimension (RDLM default)
     mix_type: str = "step"
     mix_step_thr: float = 0.0
 
@@ -127,7 +127,11 @@ class BertRDLMSampler(BaseSampler):
         """
         # Compute soft embeddings
         x_embed = x_sphere if config.embed_type == "spherical" else sphere_to_simplex(x_sphere)
-        soft_embeddings = torch.matmul(x_embed.to(embed_layer.weight.dtype), embed_layer.weight)
+        if config.add_mask_token and x_embed.shape[-1] > embed_layer.weight.shape[0]:
+            x_embed_model = x_embed[..., :embed_layer.weight.shape[0]]
+        else:
+            x_embed_model = x_embed
+        soft_embeddings = torch.matmul(x_embed_model.to(embed_layer.weight.dtype), embed_layer.weight)
 
         # Use discrete embeddings for context positions
         soft_embeddings[~flow_mask] = context_embeds[~flow_mask]
@@ -235,15 +239,13 @@ class BertRDLMSampler(BaseSampler):
             # - Geometric with sigma_0 != sigma_T: drift_coeff = log(r) / (r^(1-t) - 1)
             if config.prediction_type == "endpoint":
                 coeff = drift_coeff(t_tensor, config.schedule_type, config.sigma_0, config.sigma_T)
-                # Clamp step scale to avoid overshooting at t=1 (max step 1.0 means jump to target)
-                step_scale = (coeff * dt).clamp(max=1.0)
+                # Scale by drift coefficient
                 tangent = tangent * coeff
                 # CRITICAL: RDLM applies to_tangent AFTER scaling by drift coefficient
                 # This ensures the drift stays on the tangent plane after scaling
                 tangent = make_tangent(x_sphere, tangent)
-                
-                # Use clamped step scale for the actual update
-                tangent = tangent * (step_scale / coeff) # equiv to tangent * dt but clamped
+                # Multiply by dt (matching reference - no clamping)
+                tangent = tangent * dt
             else:
                 tangent = tangent * dt
 
@@ -354,7 +356,11 @@ class BertRDLMSampler(BaseSampler):
         if config.add_mask_token:
             mask_idx = rdlm_vocab_size - 1
         else:
-            mask_idx = config.mask_idx if config.mask_idx != -1 else model_vocab_size - 1
+            if config.mask_idx != -1:
+                mask_idx = config.mask_idx
+            else:
+                tokenizer_mask = getattr(self.tokenizer, "mask_token_id", None)
+                mask_idx = tokenizer_mask if tokenizer_mask is not None else model_vocab_size - 1
 
         # Initialize sphere state
         # Prompt positions: one-hot on sphere
@@ -500,7 +506,11 @@ class BertRDLMSampler(BaseSampler):
         if config.add_mask_token:
             mask_idx = rdlm_vocab_size - 1
         else:
-            mask_idx = config.mask_idx if config.mask_idx != -1 else model_vocab_size - 1
+            if config.mask_idx != -1:
+                mask_idx = config.mask_idx
+            else:
+                tokenizer_mask = getattr(self.tokenizer, "mask_token_id", None)
+                mask_idx = tokenizer_mask if tokenizer_mask is not None else model_vocab_size - 1
 
         # Initialize sphere state
         # Non-masked positions: one-hot on sphere
