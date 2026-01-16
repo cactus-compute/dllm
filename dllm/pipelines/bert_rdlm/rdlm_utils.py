@@ -451,6 +451,15 @@ def _coord_laplacian(x: torch.Tensor, t: torch.Tensor, scheduler, manifold_dim: 
 
 def _solve_rho(cos_norm: float, manifold_dim: int, init: float = 0.0) -> float:
     """Solve rho from Kummer function inversion (rdlm/sde.py)."""
+    # For large dimensions, use analytic approximation to avoid numerical instability of hyp1f1
+    # E[cos] approx 1 - (D-1) * rho^2 / 2
+    # This approximation is accurate when rho is small and D is large
+    if manifold_dim > 100 and cos_norm > 0.1:
+        val = (2 * (1 - cos_norm) / (manifold_dim - 1))
+        if val > 0:
+            return math.sqrt(val)
+        return 0.0
+
     import numpy as np
     import scipy.special as sp
     from scipy.optimize import fsolve
