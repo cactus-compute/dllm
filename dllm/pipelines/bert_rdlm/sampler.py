@@ -115,7 +115,8 @@ class BertRDLMSampler(BaseSampler):
         temperature: float,
         embed_layer,
         time_embedding: Optional[TimeEmbedding] = None,
-    ) -> torch.Tensor:
+        return_logits: bool = False,
+    ):
         """
         Compute tangent vector (velocity/drift) at current state.
 
@@ -129,9 +130,11 @@ class BertRDLMSampler(BaseSampler):
             temperature: sampling temperature
             embed_layer: model's embedding layer
             time_embedding: optional time embedding module
+            return_logits: whether to also return raw logits
 
         Returns:
             tangent: tangent vector [B, T, V]
+            If return_logits=True, also returns logits [B, T, V_model]
         """
         # Compute soft embeddings with proper mask dimension handling
         # Maps the RDLM mask dimension (V+1) to BERT's [MASK] embedding
@@ -163,6 +166,9 @@ class BertRDLMSampler(BaseSampler):
         )
         logits = outputs.logits
 
+        # Save raw logits before temperature scaling if needed
+        raw_logits = logits.clone() if return_logits else None
+
         # Apply temperature
         if temperature > 0:
             logits = logits / temperature
@@ -191,6 +197,8 @@ class BertRDLMSampler(BaseSampler):
         else:
             raise ValueError(f"Unknown prediction_type: {config.prediction_type}")
 
+        if return_logits:
+            return tangent, raw_logits
         return tangent
 
     def flow_integrate(
@@ -202,6 +210,7 @@ class BertRDLMSampler(BaseSampler):
         config: BertRDLMSamplerConfig,
         time_embedding: Optional[TimeEmbedding] = None,
         return_histories: bool = False,
+        return_first_step_logits: bool = False,
     ) -> torch.Tensor:
         """
         Integrate flow from t=0 to t=1.
@@ -214,9 +223,11 @@ class BertRDLMSampler(BaseSampler):
             config: sampler config
             time_embedding: optional time embedding
             return_histories: whether to return intermediate states
+            return_first_step_logits: whether to return logits from the first step
 
         Returns:
             x_sphere: final state on sphere [B, T, V]
+            If return_first_step_logits=True, also returns first_step_logits [B, T, V_model]
         """
         # Get embedding layer
         if hasattr(self.model, "get_input_embeddings"):
@@ -234,6 +245,7 @@ class BertRDLMSampler(BaseSampler):
 
         histories = [] if return_histories else None
         model_vocab_size = embed_layer.weight.shape[0]
+        first_step_logits = None
         if return_histories:
             hist_probs = sphere_to_simplex(x_sphere)
             if hist_probs.shape[-1] > model_vocab_size:
@@ -244,11 +256,18 @@ class BertRDLMSampler(BaseSampler):
         for step in range(n_steps):
             t_tensor = timesteps[step]
 
-            # Compute tangent direction
-            tangent = self._compute_tangent(
-                x_sphere, flow_mask, context_embeds, attention_mask,
-                config, t_tensor, config.temperature, embed_layer, time_embedding
-            )
+            # Compute tangent direction (capture first-step logits if requested)
+            if step == 0 and return_first_step_logits:
+                tangent, first_step_logits = self._compute_tangent(
+                    x_sphere, flow_mask, context_embeds, attention_mask,
+                    config, t_tensor, config.temperature, embed_layer, time_embedding,
+                    return_logits=True
+                )
+            else:
+                tangent = self._compute_tangent(
+                    x_sphere, flow_mask, context_embeds, attention_mask,
+                    config, t_tensor, config.temperature, embed_layer, time_embedding
+                )
 
             # Scale by drift coefficient and dt
             # RDLM drift_coeff depends on schedule type:
@@ -314,8 +333,12 @@ class BertRDLMSampler(BaseSampler):
                     hist_probs = hist_probs[..., :model_vocab_size]
                 histories.append(hist_probs.argmax(dim=-1).clone())
 
+        if return_histories and return_first_step_logits:
+            return x_sphere, histories, first_step_logits
         if return_histories:
             return x_sphere, histories
+        if return_first_step_logits:
+            return x_sphere, first_step_logits
         return x_sphere
 
     @torch.no_grad()

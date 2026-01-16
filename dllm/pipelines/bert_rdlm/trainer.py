@@ -260,6 +260,14 @@ class BertRDLMTrainer(transformers.Trainer):
         )
         self.add_callback(self.meter)
 
+        # First-step metrics (for tracking CE improvement during integration)
+        self.first_step_meter = OnEvaluateMetricsCallback(
+            trainer=self,
+            splits=("eval",),
+            metrics={"first_step_nll": NLLMetric()},
+        )
+        self.add_callback(self.first_step_meter)
+
     def _ensure_schedule(self, device: torch.device):
         """Ensure RDLM schedule is initialized and on correct device."""
         if self.rdlm_schedule is None:
@@ -706,14 +714,30 @@ class BertRDLMTrainer(transformers.Trainer):
                 mix_step_thr=self.mix_step_thr,
             )
 
-            # Run flow integration
-            x_sphere = sampler.flow_integrate(
+            # Run flow integration (also get first-step logits for CE improvement tracking)
+            x_sphere, first_step_logits = sampler.flow_integrate(
                 x_sphere=x_sphere,
                 flow_mask=loss_mask,
                 context_embeds=context_embeds,
                 attention_mask=attention_mask,
                 config=config,
                 time_embedding=self.time_embedding if self.use_time_embedding else None,
+                return_first_step_logits=True,
+            )
+
+            # Compute first-step CE (before integration improves the predictions)
+            first_step_ce = F.cross_entropy(
+                first_step_logits.transpose(1, 2),
+                input_ids,
+                reduction="none",
+            )
+            first_step_ce = first_step_ce * loss_mask.float()
+
+            # Update first-step metrics
+            self.first_step_meter.update(
+                split="eval",
+                value=first_step_ce.detach(),
+                weight=loss_mask.float().detach(),
             )
 
             # Compute final loss

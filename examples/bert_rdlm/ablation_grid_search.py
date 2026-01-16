@@ -153,6 +153,18 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
             except OverflowError:
                 eval_ppl = float('inf')
 
+    # Get first-step NLL at best eval step (CE before integration)
+    first_step_entries = [e for e in log_history if "eval_first_step_nll" in e]
+    first_step_nll = None
+    ce_improvement = None
+    if first_step_entries:
+        # Find entry closest to best_step
+        closest_first = min(first_step_entries, key=lambda e: abs(e.get("step", 0) - best_step))
+        first_step_nll = closest_first.get("eval_first_step_nll")
+        # CE improvement = first_step_nll - final_nll (positive means integration helped)
+        if first_step_nll is not None and best_eval.get("eval_loss") is not None:
+            ce_improvement = first_step_nll - best_eval["eval_loss"]
+
     # Get train nll at best step (raw loss before weighting, from meter)
     train_nll = None
     if train_nll_entries:
@@ -164,9 +176,11 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
         "best_eval_ppl": eval_ppl,
         "best_step": best_step,
         "train_nll": train_nll,
+        "first_step_nll": first_step_nll,
+        "ce_improvement": ce_improvement,
     }
 
-    print(f"Done: best_eval_loss={metrics.get('best_eval_loss', 'N/A')}, ppl={metrics.get('best_eval_ppl', 'N/A')}")
+    print(f"Done: best_eval_loss={metrics.get('best_eval_loss', 'N/A')}, ppl={metrics.get('best_eval_ppl', 'N/A')}, ce_improvement={metrics.get('ce_improvement', 'N/A')}")
     return metrics
 
 def main():
@@ -187,6 +201,8 @@ def main():
         "best_eval_ppl",
         "best_step",
         "train_nll",
+        "first_step_nll",
+        "ce_improvement",
         "error"
     ]
     
