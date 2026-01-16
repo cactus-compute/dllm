@@ -41,8 +41,8 @@ class BertRDLMTrainerConfig(TrainingArguments):
     # Prior configuration
     prior_type: str = "mixture"  # "uniform", "masked", or "mixture"
     mixing_prob: float = 0.5    # Probability of uniform state in mixture prior
-    mask_idx: int = -1          # Index of mask token (default: last)
-    add_mask_token: bool = True
+    mask_idx: int = -1          # Index of mask token (-1 = use tokenizer's mask_token_id)
+    add_mask_token: bool = False  # False = use existing [MASK] in vocab, no extra dimension
     init_lambda: Optional[float] = None
     mix_type: str = "step"
     mix_step_thr: float = 0.0
@@ -324,14 +324,8 @@ class BertRDLMTrainer(transformers.Trainer):
             xt[prompt_mask] = 0
             xt[prompt_mask] = xt[prompt_mask].scatter(-1, input_ids[prompt_mask].unsqueeze(-1), 1.0)
 
-        # Compute soft embeddings - slice before matmul to save memory
-        if self.embed_type == "spherical":
-            x_embed = xt[..., :self.model_vocab_size] if xt.shape[-1] > self.model_vocab_size else xt
-        else:
-            x_embed = sphere_to_simplex(xt)
-            if x_embed.shape[-1] > self.model_vocab_size:
-                x_embed = x_embed[..., :self.model_vocab_size]
-
+        # Compute soft embeddings
+        x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
         soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
 
         # Free xt and x_embed if we don't need them for MSE loss
@@ -493,8 +487,6 @@ class BertRDLMTrainer(transformers.Trainer):
 
             # Compute soft embeddings
             x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
-            if x_embed.shape[-1] > model_vocab_size:
-                x_embed = x_embed[..., :model_vocab_size]
             soft_embeddings = torch.matmul(x_embed.to(compute_dtype), embed_layer.weight)
 
             # Add time embedding if enabled
