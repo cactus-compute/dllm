@@ -28,13 +28,15 @@ GRID = {
 
 # Fixed parameters (adjust for your hardware)
 FIXED_PARAMS = {
+    "num_processes": 8,                   # Number of GPUs/CPUs
     "model_name_or_path": "answerdotai/ModernBERT-base",
     "dataset_args": "tatsu-lab/alpaca",
-    "max_length": 512,
+    "max_length": 1024,
     "num_train_epochs": 1,                # Fewer epochs for ablation
-    "per_device_train_batch_size": 16,
-    "per_device_eval_batch_size": 8,
-    "gradient_accumulation_steps": 4,
+    "per_device_train_batch_size": 24,
+    "per_device_eval_batch_size": 12,
+    "learning_rate": "5e-5",
+    "gradient_accumulation_steps": 1,
     "eval_integration_steps": 256,         # Moderate steps for faster sweep
     "eval_stochastic": "false",            # ODE is more stable in high-D
     "save_only_model": "true",
@@ -53,13 +55,16 @@ def run_training(params: dict, output_dir: str, run_idx: int, total_runs: int) -
     run_name = get_run_name(params)
     
     cmd = [
-        "accelerate", "launch", "examples/bert_rdlm/sft.py",
+        "accelerate", "launch",
+        "--num_processes", str(FIXED_PARAMS["num_processes"]),
+        "examples/bert_rdlm/sft.py",
         "--model_name_or_path", FIXED_PARAMS["model_name_or_path"],
         "--dataset_args", FIXED_PARAMS["dataset_args"],
         "--max_length", str(FIXED_PARAMS["max_length"]),
         "--num_train_epochs", str(FIXED_PARAMS["num_train_epochs"]),
         "--per_device_train_batch_size", str(FIXED_PARAMS["per_device_train_batch_size"]),
         "--per_device_eval_batch_size", str(FIXED_PARAMS["per_device_eval_batch_size"]),
+        "--learning_rate", FIXED_PARAMS["learning_rate"],
         "--gradient_accumulation_steps", str(FIXED_PARAMS["gradient_accumulation_steps"]),
         "--save_only_model", FIXED_PARAMS["save_only_model"],
         "--sigma_T", str(params["sigma_T"]),
