@@ -36,6 +36,59 @@ from .rdlm_utils import (
 )
 
 
+def compute_soft_embeddings_with_mask(
+    x_embed: torch.Tensor,
+    embed_layer: nn.Module,
+    model_vocab_size: int,
+    add_mask_token: bool,
+    bert_mask_token_id: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Compute soft embeddings, properly handling the RDLM mask dimension.
+
+    When add_mask_token=True, RDLM uses a (V+1)-dimensional representation where
+    the last dimension represents the "mask" state. Instead of simply dropping
+    this dimension (which loses information), we map it to BERT's [MASK] token
+    embedding.
+
+    This ensures that:
+    1. When x_embed has weight on the mask dimension, the resulting embedding
+       incorporates BERT's learned [MASK] representation
+    2. The semantic meaning of "masked" is preserved through BERT's embedding
+    3. The model receives meaningful gradients for masked positions
+
+    Args:
+        x_embed: [B, L, V] or [B, L, V+1] embeddings (sphere or simplex)
+        embed_layer: Model's embedding layer with weight [V, D]
+        model_vocab_size: BERT's vocabulary size (V)
+        add_mask_token: Whether RDLM is using an extra mask dimension
+        bert_mask_token_id: BERT's [MASK] token ID (typically 103)
+
+    Returns:
+        soft_embeddings: [B, L, D] weighted combination of token embeddings
+    """
+    if not add_mask_token or x_embed.shape[-1] <= model_vocab_size:
+        # No mask dimension or already correct size - standard computation
+        return torch.matmul(x_embed.to(embed_layer.weight.dtype), embed_layer.weight)
+
+    # Split into vocab dimensions and mask dimension
+    x_embed_vocab = x_embed[..., :model_vocab_size]  # [B, L, V]
+    mask_weight = x_embed[..., model_vocab_size:]     # [B, L, 1] - the mask dim weight
+
+    # Compute weighted embedding from vocabulary tokens
+    soft_embeddings = torch.matmul(
+        x_embed_vocab.to(embed_layer.weight.dtype),
+        embed_layer.weight
+    )  # [B, L, D]
+
+    # Add contribution from mask dimension using BERT's [MASK] embedding
+    if bert_mask_token_id is not None:
+        mask_embedding = embed_layer.weight[bert_mask_token_id]  # [D]
+        soft_embeddings = soft_embeddings + mask_weight.to(embed_layer.weight.dtype) * mask_embedding
+
+    return soft_embeddings
+
+
 @dataclass
 class BertRDLMTrainerConfig(TrainingArguments):
     """Configuration for BertRDLMTrainer."""
@@ -166,6 +219,11 @@ class BertRDLMTrainer(transformers.Trainer):
             else:
                 tokenizer_mask = getattr(self.processing_class, "mask_token_id", None)
                 self.mask_idx = tokenizer_mask if tokenizer_mask is not None else self.model_vocab_size - 1
+
+        # Store BERT's [MASK] token ID for mapping the RDLM mask dimension
+        # This allows us to use BERT's learned [MASK] embedding when computing
+        # soft embeddings from the (V+1)-dimensional RDLM representation
+        self.bert_mask_token_id = getattr(self.processing_class, "mask_token_id", None)
 
         # Initialize RDLM schedule with precomputed values
         # Note: We defer device placement until first compute_loss call
@@ -399,14 +457,16 @@ class BertRDLMTrainer(transformers.Trainer):
         ):
             xt = self._add_tangent_noise(xt, t, loss_mask, self.self_consistency_noise_scale)
 
-        # Compute soft embeddings (memory-optimized)
+        # Compute soft embeddings with proper mask dimension handling
+        # Maps the RDLM mask dimension (V+1) to BERT's [MASK] embedding
         x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
-        if self.add_mask_token and x_embed.shape[-1] > self.model_vocab_size:
-            x_embed_model = x_embed[..., :self.model_vocab_size]
-        else:
-            x_embed_model = x_embed
-        soft_embeddings = torch.matmul(x_embed_model.to(compute_dtype), embed_layer.weight)
-        del x_embed_model  # Free the slice/reference
+        soft_embeddings = compute_soft_embeddings_with_mask(
+            x_embed=x_embed,
+            embed_layer=embed_layer,
+            model_vocab_size=self.model_vocab_size,
+            add_mask_token=self.add_mask_token,
+            bert_mask_token_id=self.bert_mask_token_id,
+        )
 
         # Free xt and x_embed if we don't need them for MSE loss
         if self.loss_type == "ce":
@@ -568,13 +628,15 @@ class BertRDLMTrainer(transformers.Trainer):
                 prompt_indices = input_ids[prompt_mask].unsqueeze(-1)
                 xt[prompt_mask] = xt[prompt_mask].scatter(-1, prompt_indices, 1.0)
 
-            # Compute soft embeddings
+            # Compute soft embeddings with proper mask dimension handling
             x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
-            if self.add_mask_token and x_embed.shape[-1] > self.model_vocab_size:
-                x_embed_model = x_embed[..., :self.model_vocab_size]
-            else:
-                x_embed_model = x_embed
-            soft_embeddings = torch.matmul(x_embed_model.to(compute_dtype), embed_layer.weight)
+            soft_embeddings = compute_soft_embeddings_with_mask(
+                x_embed=x_embed,
+                embed_layer=embed_layer,
+                model_vocab_size=self.model_vocab_size,
+                add_mask_token=self.add_mask_token,
+                bert_mask_token_id=self.bert_mask_token_id,
+            )
 
             # Add time embedding if enabled
             if self.use_time_embedding and self.time_embedding is not None:

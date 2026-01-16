@@ -29,6 +29,7 @@ from .rdlm_utils import (
     cosine_schedule,
     drift_coeff,
 )
+from .trainer import compute_soft_embeddings_with_mask
 
 
 @dataclass
@@ -132,13 +133,18 @@ class BertRDLMSampler(BaseSampler):
         Returns:
             tangent: tangent vector [B, T, V]
         """
-        # Compute soft embeddings
+        # Compute soft embeddings with proper mask dimension handling
+        # Maps the RDLM mask dimension (V+1) to BERT's [MASK] embedding
         x_embed = x_sphere if config.embed_type == "spherical" else sphere_to_simplex(x_sphere)
-        if config.add_mask_token and x_embed.shape[-1] > embed_layer.weight.shape[0]:
-            x_embed_model = x_embed[..., :embed_layer.weight.shape[0]]
-        else:
-            x_embed_model = x_embed
-        soft_embeddings = torch.matmul(x_embed_model.to(embed_layer.weight.dtype), embed_layer.weight)
+        model_vocab_size = embed_layer.weight.shape[0]
+        bert_mask_token_id = getattr(self.tokenizer, "mask_token_id", None)
+        soft_embeddings = compute_soft_embeddings_with_mask(
+            x_embed=x_embed,
+            embed_layer=embed_layer,
+            model_vocab_size=model_vocab_size,
+            add_mask_token=config.add_mask_token,
+            bert_mask_token_id=bert_mask_token_id,
+        )
 
         # Use discrete embeddings for context positions
         soft_embeddings[~flow_mask] = context_embeds[~flow_mask]
