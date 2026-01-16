@@ -19,7 +19,7 @@ import transformers
 from dllm.utils.configs import TrainingArguments
 from dllm.core.trainers.utils import NLLMetric, PPLMetric, OnEvaluateMetricsCallback
 from dllm.pipelines.bert_sfm.geodesic_utils import (
-    exp_map, log_map, make_tangent, uniform_prior,
+    exp_map, exp_map_inplace, log_map, make_tangent, uniform_prior,
     simplex_to_sphere, sphere_to_simplex,
     TimeEmbedding,
 )
@@ -276,6 +276,8 @@ class BertRDLMTrainer(transformers.Trainer):
         """
         Add tangent-space noise at xt to expose the model to off-bridge states.
 
+        Memory-optimized version using in-place operations.
+
         Args:
             xt: Current state on sphere, shape (B, L, V)
             t: Time values, shape (B,)
@@ -286,16 +288,29 @@ class BertRDLMTrainer(transformers.Trainer):
             Perturbed state on sphere, shape (B, L, V)
         """
         b, l, _ = xt.shape
+
+        # Generate noise and project to tangent space in-place
         noise = torch.randn_like(xt)
-        tangent_noise = make_tangent(xt, noise)
+        # make_tangent: v - <p, v> * p
+        dot_pv = (xt * noise).sum(dim=-1, keepdim=True)
+        noise.sub_(dot_pv * xt)  # noise is now tangent vector
+        del dot_pv
 
+        # Scale noise in-place: tangent * t * noise_scale
         t_expanded = t.view(b, 1, 1)
-        scaled_noise = tangent_noise * t_expanded * noise_scale
+        noise.mul_(t_expanded * noise_scale)
 
-        xt_noisy = exp_map(xt, scaled_noise)
-        xt_noisy = xt_noisy / torch.norm(xt_noisy, dim=-1, keepdim=True).clamp(min=1e-8)
+        # Use in-place exp_map
+        xt_noisy = exp_map_inplace(xt, noise)  # noise tensor now contains result
+        del noise
 
-        flow_mask_expanded = loss_mask.unsqueeze(-1).expand_as(xt)
+        # Normalize in-place
+        norm = xt_noisy.norm(dim=-1, keepdim=True).clamp_(min=1e-8)
+        xt_noisy.div_(norm)
+        del norm
+
+        # Apply mask: only update flow positions
+        flow_mask_expanded = loss_mask.unsqueeze(-1)
         return torch.where(flow_mask_expanded, xt_noisy, xt)
 
     def compute_loss(
@@ -375,13 +390,14 @@ class BertRDLMTrainer(transformers.Trainer):
         ):
             xt = self._add_tangent_noise(xt, t, loss_mask, self.self_consistency_noise_scale)
 
-        # Compute soft embeddings
+        # Compute soft embeddings (memory-optimized)
         x_embed = xt if self.embed_type == "spherical" else sphere_to_simplex(xt)
         if self.add_mask_token and x_embed.shape[-1] > self.model_vocab_size:
             x_embed_model = x_embed[..., :self.model_vocab_size]
         else:
             x_embed_model = x_embed
         soft_embeddings = torch.matmul(x_embed_model.to(compute_dtype), embed_layer.weight)
+        del x_embed_model  # Free the slice/reference
 
         # Free xt and x_embed if we don't need them for MSE loss
         if self.loss_type == "ce":

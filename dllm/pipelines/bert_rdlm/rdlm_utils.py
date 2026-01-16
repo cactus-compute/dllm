@@ -28,8 +28,8 @@ def _is_main_process() -> bool:
 
 # Reuse geodesic utilities from bert_sfm
 from dllm.pipelines.bert_sfm.geodesic_utils import (
-    exp_map,
-    log_map,
+    exp_map_inplace,
+    log_map_inplace,
     make_tangent,
     simplex_to_sphere,
     sphere_to_simplex,
@@ -1068,8 +1068,8 @@ def rdlm_interpolant(
 
             tangent = make_tangent(mu, normal)
             del normal
-            result = exp_map(mu, tangent)
-            del mu, tangent
+            result = exp_map_inplace(mu, tangent)  # tangent now contains result
+            del mu
             return result
 
         # Init path (non-mixture)
@@ -1097,8 +1097,8 @@ def rdlm_interpolant(
 
         tangent = make_tangent(mu, normal)
         del normal
-        result = exp_map(mu, tangent)
-        del mu, tangent
+        result = exp_map_inplace(mu, tangent)  # tangent now contains result
+        del mu
         return result
 
     if alpha_t is None or rho_t is None or vocab_size is None:
@@ -1146,6 +1146,8 @@ def compute_target_drift(
 
     RDLM Equation 12: b(x,t) = γ_t * log_x(e_k)
 
+    Memory-optimized version using in-place operations.
+
     Args:
         xt: [B, L, D] current position on sphere
         target_indices: [B, L] target token indices
@@ -1163,14 +1165,14 @@ def compute_target_drift(
     x1 = torch.zeros(B, L, vocab_size, device=device, dtype=dtype)
     x1.scatter_(-1, target_indices.unsqueeze(-1), 1.0)
 
-    # Compute log map (direction from xt to x1)
-    log_vec = log_map(xt, x1)
+    # Compute log map in-place (direction from xt to x1)
+    # x1 will be modified to contain the result
+    drift = log_map_inplace(xt, x1)
 
-    # Scale by γ_t
+    # Scale by γ_t (in-place)
     if isinstance(gamma_t, torch.Tensor) and gamma_t.dim() >= 1:
         gamma_t = gamma_t.view(-1, 1, 1)
-
-    drift = gamma_t * log_vec
+    drift.mul_(gamma_t)
 
     return drift
 

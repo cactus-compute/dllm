@@ -13,14 +13,10 @@ from tqdm import tqdm
 
 from dllm.core.samplers.base import BaseSampler, SamplerConfig, SamplerOutput
 from dllm.pipelines.bert_sfm.geodesic_utils import (
-    exp_map,
     exp_map_inplace,
-    log_map,
-    log_map_inplace,
     make_tangent,
     simplex_to_sphere,
     sphere_to_simplex,
-    uniform_prior,
     TimeEmbedding,
     expected_logmap_to_onehots,
 )
@@ -160,17 +156,21 @@ class BertRDLMSampler(BaseSampler):
             # Compute expected log-map toward one-hots weighted by probabilities
             # This matches RDLM's weighted_sum operation
             probs = F.softmax(logits.to(torch.float32), dim=-1)
+            del logits
             if probs.shape[-1] < x_sphere.shape[-1]:
                 pad = x_sphere.shape[-1] - probs.shape[-1]
                 probs = torch.cat([probs, probs.new_zeros(*probs.shape[:-1], pad)], dim=-1)
             # Use positive_orthant=False to handle full sphere (RDLM style)
             tangent = expected_logmap_to_onehots(x_sphere, probs, positive_orthant=False)
+            del probs
         elif config.prediction_type == "drift":
             drift = logits
+            del logits
             if drift.shape[-1] < x_sphere.shape[-1]:
                 pad = x_sphere.shape[-1] - drift.shape[-1]
                 drift = torch.cat([drift, drift.new_zeros(*drift.shape[:-1], pad)], dim=-1)
             tangent = make_tangent(x_sphere, drift)
+            del drift
         else:
             raise ValueError(f"Unknown prediction_type: {config.prediction_type}")
 
@@ -258,16 +258,20 @@ class BertRDLMSampler(BaseSampler):
                 noise = torch.randn_like(x_sphere)
                 # Don't project noise yet - RDLM doesn't project noise before adding
                 tangent = tangent + diffusion * noise * math.sqrt(dt)
+                del noise
 
             # CRITICAL: Project final tangent vector before exp_map
             # RDLM's exp() internally calls to_tangent before computing the exponential
             tangent = make_tangent(x_sphere, tangent)
 
-            # Take step via exponential map
-            x_new = exp_map(x_sphere, tangent)
+            # Take step via exponential map (in-place for memory efficiency)
+            x_new = exp_map_inplace(x_sphere, tangent)  # tangent now contains result
+            del tangent
 
-            # Project to sphere for numerical stability
-            x_new = x_new / torch.norm(x_new, dim=-1, keepdim=True).clamp(min=1e-8)
+            # Project to sphere for numerical stability (in-place)
+            norm = x_new.norm(dim=-1, keepdim=True).clamp_(min=1e-8)
+            x_new.div_(norm)
+            del norm
 
             # Only update flow positions
             x_sphere = torch.where(
